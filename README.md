@@ -2,7 +2,7 @@
 
 A feature-rich cryptocurrency miner for ESP32-S3 (LilyGo T-Display) supporting Bitcoin (BTC), Bitcoin Cash (BCH), and Duino-Coin mining with an elegant AMOLED display interface.
 
-![TzCoin Miner Display](images/IMG_3256.HEIC)
+![TzCoin Miner Display](images/IMG_3256.heic)
 
 ![TzCoin Miner Display](images/IMG_3243.HEIC)
 
