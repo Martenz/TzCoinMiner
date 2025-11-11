@@ -6,6 +6,11 @@
 
 static const char* TAG = "STRATUM";
 
+// Configurazione difficoltà per ESP32 (come NerdMiner)
+#define DEFAULT_DIFFICULTY 512    // Difficoltà iniziale suggerita al pool
+#define MIN_DIFFICULTY 256        // Minimo accettabile per ESP32
+#define MAX_DIFFICULTY 4096       // Massimo gestibile da ESP32
+
 static WiFiClient stratum_tcp_client;
 static bool stratum_connected = false;
 static String stratum_host;
@@ -145,9 +150,28 @@ static void stratum_process_difficulty(JsonArray params) {
     }
     
     float diff = params[0].as<float>();
-    stratum_difficulty = (uint32_t)diff;
+    uint32_t requested_difficulty = (uint32_t)diff;
     
-    ESP_LOGI(TAG, "Difficulty set to: %u", stratum_difficulty);
+    // Log della difficoltà ricevuta dal pool
+    ESP_LOGI(TAG, "Pool requested difficulty: %u", requested_difficulty);
+    
+    // Verifica se la difficoltà è gestibile da ESP32
+    if (requested_difficulty > MAX_DIFFICULTY) {
+        Serial.printf("⚠️  Difficoltà troppo alta! Pool richiede: %u, max ESP32: %u\n", 
+                      requested_difficulty, MAX_DIFFICULTY);
+        Serial.printf("   Il pool abbasserà automaticamente quando non riceve share\n");
+        
+        // Usa comunque la difficoltà del pool (il pool si auto-regolerà)
+        stratum_difficulty = requested_difficulty;
+    } else if (requested_difficulty < MIN_DIFFICULTY) {
+        Serial.printf("⚠️  Difficoltà molto bassa: %u (min raccomandato: %u)\n", 
+                      requested_difficulty, MIN_DIFFICULTY);
+        stratum_difficulty = requested_difficulty;
+    } else {
+        // Difficoltà nel range ottimale per ESP32
+        stratum_difficulty = requested_difficulty;
+        Serial.printf("✅ Difficoltà ottimale per ESP32: %u\n", stratum_difficulty);
+    }
     
     // Calcola zeri approssimativi richiesti (per info)
     int approx_zeros = 8;
@@ -166,6 +190,24 @@ static void stratum_process_difficulty(JsonArray params) {
     
     Serial.printf("📊 Pool difficulty settata a: %u (~%d zeri richiesti)\n", 
                   stratum_difficulty, approx_zeros);
+    
+    // Stima tempo medio per share (correzione per evitare overflow)
+    if (stratum_difficulty <= MAX_DIFFICULTY && approx_zeros <= 16) {
+        // Calcolo più accurato: 2^(zeros * 4) / hashrate
+        // Per evitare overflow, calcoliamo in modo incrementale
+        double avg_hashes = pow(2.0, approx_zeros * 4);  // Più accurato di 16^zeros
+        double avg_seconds = avg_hashes / 12000.0;  // Assumendo 12 KH/s
+        
+        if (avg_seconds < 60) {
+            Serial.printf("   Tempo medio per share: ~%.0f secondi\n", avg_seconds);
+        } else if (avg_seconds < 3600) {
+            Serial.printf("   Tempo medio per share: ~%.1f minuti\n", avg_seconds / 60.0);
+        } else if (avg_seconds < 86400) {
+            Serial.printf("   Tempo medio per share: ~%.1f ore\n", avg_seconds / 3600.0);
+        } else {
+            Serial.printf("   Tempo medio per share: ~%.1f giorni\n", avg_seconds / 86400.0);
+        }
+    }
 }
 
 void stratum_init(const char* pool_url, uint16_t port, const char* wallet_address, const char* worker_name, const char* password) {
@@ -196,12 +238,24 @@ bool stratum_connect() {
     ESP_LOGI(TAG, "Connected to pool");
     stratum_connected = true;
     
-    // Invia mining.subscribe
+    // Invia mining.subscribe con suggest_difficulty (come NerdMiner)
     JsonDocument doc;
     doc["id"] = 1;
     doc["method"] = "mining.subscribe";
     JsonArray params = doc["params"].to<JsonArray>();
+    
+    // User agent
     params.add("TzBtcMiner/1.0");
+    
+    // Suggerisci difficoltà iniziale ottimale per ESP32
+    // Nota: Il pool può accettarla, ignorarla o usarla come punto di partenza
+    String diffSuggestion = String("EthereumStratum/1.0.0");
+    params.add(diffSuggestion);
+    
+    // Alcuni pool accettano suggest_difficulty come terzo parametro
+    params.add(String("suggest_difficulty=") + String(DEFAULT_DIFFICULTY));
+    
+    Serial.printf("📡 Richiesta al pool con difficoltà suggerita: %d\n", DEFAULT_DIFFICULTY);
     
     if (!stratum_send_message(doc)) {
         stratum_tcp_client.stop();

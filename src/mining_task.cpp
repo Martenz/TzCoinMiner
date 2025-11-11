@@ -78,9 +78,16 @@ void on_stratum_job(stratum_job_t* job) {
     current_pool_job = *job;
     has_pool_job = true;
     
-    // Aggiorna difficoltà
+    // Aggiorna difficoltà dal pool
     pool_difficulty = stratum_get_difficulty();
-    Serial.printf("   Difficulty: %u\n", pool_difficulty);
+    
+    // Se il pool non ha mai inviato mining.set_difficulty, usa valore default
+    if (pool_difficulty == 0) {
+        pool_difficulty = 512;  // Default ottimale per ESP32
+        Serial.printf("   Difficulty: %u (default - pool non ha inviato set_difficulty)\n", pool_difficulty);
+    } else {
+        Serial.printf("   Difficulty: %u\n", pool_difficulty);
+    }
 }
 
 // Calcola SHA-256 doppio (come richiesto da Bitcoin)
@@ -401,17 +408,10 @@ void miningTask(void* parameter)
                 sscanf(current_pool_job.prev_hash.c_str() + (i * 2), "%2hhx", &pool_header.prevBlockHash[31 - i]);
             }
             
-            // Calcola merkle root corretto
-            // NOTA: Il calcolo del merkle root sembra avere problemi
-            // Per ora usiamo un valore random che funzionava prima
-            // uint8_t coinbase_hash[32];
-            // build_coinbase(&current_pool_job, extranonce2, coinbase_hash);
-            // calculate_merkle_root(coinbase_hash, current_pool_job.merkle_branch, pool_header.merkleRoot);
-            
-            // Merkle root random (temporaneo - funzionava prima)
-            for(int i = 0; i < 32; i++) {
-                pool_header.merkleRoot[i] = random(0, 256);
-            }
+            // Calcola merkle root corretto dalla coinbase e merkle branch
+            uint8_t coinbase_hash[32];
+            build_coinbase(&current_pool_job, extranonce2, coinbase_hash);
+            calculate_merkle_root(coinbase_hash, current_pool_job.merkle_branch, pool_header.merkleRoot);
             
             // nBits (difficulty)
             pool_header.bits = strtoul(current_pool_job.nbits.c_str(), NULL, 16);
