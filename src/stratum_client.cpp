@@ -148,6 +148,24 @@ static void stratum_process_difficulty(JsonArray params) {
     stratum_difficulty = (uint32_t)diff;
     
     ESP_LOGI(TAG, "Difficulty set to: %u", stratum_difficulty);
+    
+    // Calcola zeri approssimativi richiesti (per info)
+    int approx_zeros = 8;
+    uint32_t d = stratum_difficulty;
+    if (d <= 1) approx_zeros = 8;
+    else if (d <= 2) approx_zeros = 9;
+    else if (d <= 8) approx_zeros = 10;
+    else if (d <= 32) approx_zeros = 10;
+    else if (d <= 128) approx_zeros = 11;
+    else if (d <= 512) approx_zeros = 12;
+    else if (d <= 2048) approx_zeros = 13;
+    else if (d <= 8192) approx_zeros = 14;
+    else if (d <= 32768) approx_zeros = 15;
+    else if (d <= 131072) approx_zeros = 16;
+    else approx_zeros = 17;
+    
+    Serial.printf("📊 Pool difficulty settata a: %u (~%d zeri richiesti)\n", 
+                  stratum_difficulty, approx_zeros);
 }
 
 void stratum_init(const char* pool_url, uint16_t port, const char* wallet_address, const char* worker_name, const char* password) {

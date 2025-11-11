@@ -190,6 +190,43 @@ bool check_hash_difficulty(const uint8_t* hash, uint32_t difficulty_bits) {
     return leading_zeros >= required_zeros;
 }
 
+// Converte pool difficulty in numero di zeri richiesti (approssimazione)
+// Bitcoin difficulty relationship: ogni ~4x in difficulty ≈ +1 zero
+// Difficulty 1 inizia con ~8 zeri
+int difficulty_to_zeros(uint32_t difficulty) {
+    if (difficulty <= 1) return 8;
+    if (difficulty <= 2) return 9;
+    if (difficulty <= 8) return 10;
+    if (difficulty <= 32) return 10;   // Difficulty 32 richiede ~10 zeri
+    if (difficulty <= 128) return 11;
+    if (difficulty <= 512) return 12;
+    if (difficulty <= 2048) return 13;
+    if (difficulty <= 8192) return 14;
+    if (difficulty <= 32768) return 15;
+    if (difficulty <= 131072) return 16;
+    // Per difficoltà molto alte
+    return 17;
+}
+
+// Verifica se un hash soddisfa la difficoltà del pool
+// Usa una versione semplificata basata sul conteggio degli zeri
+// Questo è più efficiente per ESP32 e funziona bene per difficoltà pool tipiche
+bool hash_meets_pool_difficulty(const uint8_t* hash, uint32_t pool_difficulty) {
+    // Se la difficoltà non è stata ancora settata dal pool, usa valore conservativo
+    if (pool_difficulty == 0) {
+        pool_difficulty = 1;
+    }
+    
+    // Converti la difficoltà in zeri richiesti
+    int required_zeros = difficulty_to_zeros(pool_difficulty);
+    
+    // Conta gli zeri nell'hash
+    int zeros = count_leading_zeros(hash);
+    
+    // L'hash è valido se ha almeno il numero richiesto di zeri
+    return zeros >= required_zeros;
+}
+
 // Mining task function - runs in background
 void miningTask(void* parameter)
 {
@@ -405,17 +442,22 @@ void miningTask(void* parameter)
                     stats.best_difficulty = zeros;
                     hash_to_hex(hash, hash_hex);
                     memcpy(stats.best_hash, hash_hex, 65);
+                    
+                    // Log quando troviamo un hash interessante (ma non necessariamente valido)
+                    if (zeros >= 4) {
+                        Serial.printf("🔍 Hash interessante trovato con %d zeri (best finora)\n", zeros);
+                    }
                 }
                 
-                // Controlla se hash è valido per la difficoltà del pool
-                // Per ESP32, accettiamo qualsiasi hash con almeno 4 zeri iniziali
-                // Un vero pool userebbe la difficoltà target corretta
-                int required_zeros = 4;  // Molto basso per permettere all'ESP32 di trovare shares
-                if(zeros >= required_zeros) {
-                    Serial.println("⭐ SHARE TROVATA!");
+                // Controlla se hash soddisfa la difficoltà del pool
+                // Usa il conteggio degli zeri calibrato per la pool difficulty
+                if(hash_meets_pool_difficulty(hash, pool_difficulty)) {
+                    Serial.println("⭐ SHARE VALIDA TROVATA!");
                     Serial.printf("   Nonce: 0x%08x\n", pool_header.nonce);
                     Serial.printf("   Hash: %s\n", hash_hex);
-                    Serial.printf("   Zeros: %d (required: %d)\n", zeros, required_zeros);
+                    Serial.printf("   Zeros: %d\n", zeros);
+                    Serial.printf("   Pool difficulty: %u (richiede ~%d zeri)\n", 
+                                  pool_difficulty, difficulty_to_zeros(pool_difficulty));
                     Serial.printf("   Extranonce2: 0x%08x\n", extranonce2);
                     
                     // Prepara dati per submit
