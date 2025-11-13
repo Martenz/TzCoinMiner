@@ -712,9 +712,19 @@ void display_page_mining(bool miningActive, bool wifiConnected, const char* time
             }
             drawText(line1, statusTextX, statsY, white, statsScale, false);
             
-            // Line 2: Best difficulty
+            // Line 2: Best difficulty - show zeros (more intuitive) with difficulty in parentheses
             char line2[32];
-            snprintf(line2, sizeof(line2), "best: %u", stats.best_difficulty);
+            if (stats.best_difficulty_zeros > 0) {
+                // Show zeros count with difficulty
+                if (stats.best_difficulty < 1000.0) {
+                    snprintf(line2, sizeof(line2), "best: %uz (%.0f)", 
+                            stats.best_difficulty_zeros, stats.best_difficulty);
+                } else {
+                    snprintf(line2, sizeof(line2), "best: %uz", stats.best_difficulty_zeros);
+                }
+            } else {
+                snprintf(line2, sizeof(line2), "best: 0z");
+            }
             drawText(line2, statusTextX, statsY + lineSpacing, white, statsScale, false);
             
             // Line 3: Block height, pool difficulty, or demo

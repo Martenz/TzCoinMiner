@@ -7,7 +7,8 @@
 struct MiningStats {
     uint32_t hashes_per_second;
     uint32_t total_hashes;
-    uint32_t best_difficulty;
+    double best_difficulty;  // Changed to double for NerdMiner-style difficulty calculation
+    uint32_t best_difficulty_zeros;  // Leading zeros count for best difficulty (for display)
     char best_hash[65]; // SHA256 hash as hex string
     uint32_t shares_submitted;  // Total shares submitted to pool
     uint32_t shares_accepted;   // Shares accepted by pool

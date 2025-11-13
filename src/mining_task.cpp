@@ -180,6 +180,55 @@ int difficulty_to_zeros(uint32_t difficulty) {
     return 20; // Qualsiasi altra difficoltà
 }
 
+// NerdMiner-style difficulty calculation from hash
+// Bitcoin difficulty 1 target
+const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+
+// Convert little-endian 256-bit value to double
+static double le256todouble(const void* target) {
+    uint64_t v64;
+    const uint8_t* data = (const uint8_t*)target;
+    
+    // Find first non-zero byte from the end (big-endian perspective)
+    int i;
+    for (i = 31; i >= 0; i--) {
+        if (data[i] != 0)
+            break;
+    }
+    
+    if (i < 0)
+        return 0.0;
+    
+    // Take up to 8 bytes for double precision
+    int start = (i >= 7) ? (i - 7) : 0;
+    v64 = 0;
+    
+    for (int j = i; j >= start; j--) {
+        v64 = (v64 << 8) | data[j];
+    }
+    
+    // Adjust for position
+    int shift = start * 8;
+    double d = (double)v64;
+    
+    // Scale by position
+    for (int j = 0; j < shift; j += 8) {
+        d *= 256.0;
+    }
+    
+    return d;
+}
+
+// Calculate difficulty from hash (NerdMiner algorithm)
+double diff_from_target(const uint8_t* hash) {
+    double d64 = truediffone;
+    double dcut64 = le256todouble(hash);
+    
+    if (dcut64 == 0.0)
+        dcut64 = 1.0;
+    
+    return d64 / dcut64;
+}
 
 // Costruisce la coinbase transaction da componenti Stratum
 void build_coinbase(const stratum_job_t* job, uint32_t extranonce2_value, uint8_t* coinbase_hash) {
@@ -613,9 +662,9 @@ void miningTask(void* parameter)
                 // �🔧 WATCHDOG FIX: Yield every 8K hashes (safer for slower speeds)
                 // At 33 KH/s: 8K hashes = ~242ms work
                 // Light yield (1 tick ~10ms) = ~4% overhead
-                if((batch_hashes % 8000) == 0) {
-                    vTaskDelay(1 / portTICK_PERIOD_MS);  // Yield 1 tick only
-                    esp_task_wdt_reset();  // Explicit watchdog reset
+                if((batch_hashes % 4000) == 0) {
+                    vTaskDelay(2);
+                    esp_task_wdt_reset();
                 }
                 
                 // ⚡ OTTIMIZZAZIONE 1: Quick check PRIMA di invertire byte!
@@ -631,16 +680,21 @@ void miningTask(void* parameter)
                 // Conta zeri solo ora
                 int zeros = count_leading_zeros(hash_reversed);
                 
-                // Aggiorna best assoluto solo se migliora
+                // Aggiorna best assoluto solo se migliora (track by zeros for speed)
                 if(zeros > absolute_best_zeros) {
                     absolute_best_zeros = zeros;
                     hash_to_hex(hash_reversed, hash_hex);
                     memcpy(absolute_best_hash, hash_hex, 65);
-                    stats->best_difficulty = zeros;
+                    
+                    // Calculate difficulty only when we find a new best
+                    double hash_difficulty = diff_from_target(hash_reversed);
+                    stats->best_difficulty = hash_difficulty;
+                    stats->best_difficulty_zeros = zeros;
                     memcpy(stats->best_hash, hash_hex, 65);
                     
                     if(zeros >= 4) {
-                        Serial.printf("🎯 New best: %d zeros - Hash: %s\n", zeros, hash_hex);
+                        Serial.printf("🎯 New best: %d zeros (%.0f difficulty) - Hash: %s\n", 
+                                     zeros, hash_difficulty, hash_hex);
                     }
                 }
                 
@@ -649,17 +703,21 @@ void miningTask(void* parameter)
                     best_zeros = zeros;
                 }
                 
-                // Controlla se è valido per share submission
-                if(zeros >= effective_zeros_needed) {
-                    char share_hash_hex[65];
-                    hash_to_hex(hash_reversed, share_hash_hex);
+                // 🚀 NERDMINER SHARE VALIDATION: Only calculate difficulty for high-zero hashes
+                // For pool difficulty validation, only check hashes with enough zeros
+                if(zeros >= (required_zeros - 1)) {  // Check hashes close to requirement
+                    double hash_difficulty = diff_from_target(hash_reversed);
                     
-                    Serial.println("⭐ SHARE TROVATA!");
-                    Serial.printf("   Nonce: 0x%08x\n", pool_header.nonce);
-                    Serial.printf("   Hash: %s\n", share_hash_hex);
-                    Serial.printf("   Zeros: %d (pool requires: %d for diff %u)\n", 
-                                 zeros, required_zeros, effective_diff);
-                    Serial.printf("   Extranonce2: 0x%08x\n", extranonce2);
+                    if(hash_difficulty >= (double)effective_diff) {
+                        char share_hash_hex[65];
+                        hash_to_hex(hash_reversed, share_hash_hex);
+                        
+                        Serial.println("⭐ VALID SHARE FOUND!");
+                        Serial.printf("   Nonce: 0x%08x\n", pool_header.nonce);
+                        Serial.printf("   Hash: %s\n", share_hash_hex);
+                        Serial.printf("   Hash Difficulty: %.2f (zeros: %d)\n", hash_difficulty, zeros);
+                        Serial.printf("   Pool Difficulty: %u\n", effective_diff);
+                        Serial.printf("   Extranonce2: 0x%08x\n", extranonce2);
                     
                     // Prepara dati per submit (CORRETTO byte order come NerdMiner)
                     char nonce_hex[9];
@@ -703,7 +761,8 @@ void miningTask(void* parameter)
                     // Incrementa extranonce2 per la prossima share e ricalcola merkle
                     extranonce2++;
                     break;  // Esci dal batch e ricalcola merkle root
-                }  // Fine if(zeros >= effective_zeros_needed)
+                    }  // Fine if(hash_difficulty >= effective_diff)
+                }  // Fine if(zeros >= required_zeros - 1)
             }  // Fine for nonce loop
             
             // Calcola hashrate dopo ogni batch
@@ -735,7 +794,8 @@ void miningTask(void* parameter)
             Serial.printf("  Batch time:       %u ms (%.1f sec)\n", batch_elapsed, batch_elapsed / 1000.0);
             Serial.printf("  Batch hashes:     %u\n", batch_hashes);
             Serial.printf("  Total hashes:     %u\n", stats->total_hashes);
-            Serial.printf("  Absolute best:    %u zeros\n", absolute_best_zeros);
+            Serial.printf("  Absolute best:    %.0f difficulty (%u zeros)\n", 
+                         stats->best_difficulty, absolute_best_zeros);
             if(absolute_best_zeros > 0) {
                 Serial.printf("  Best hash:        %s\n", absolute_best_hash);
             }
@@ -761,9 +821,9 @@ void miningTask(void* parameter)
         hashes++;
         stats->total_hashes++;
         
-        // 🔧 WATCHDOG FIX: Yield every 8K hashes in educational mode too
-        if((hashes % 8000) == 0) {
-            vTaskDelay(1 / portTICK_PERIOD_MS);
+        // 🔧 WATCHDOG FIX: Yield every 4K hashes in educational mode too
+        if((hashes % 4000) == 0) {
+            vTaskDelay(2);
             esp_task_wdt_reset();
         }
         
@@ -1003,9 +1063,15 @@ MiningStats mining_get_stats(void)
     combined.total_hashes = stats_worker0.total_hashes + stats_worker1.total_hashes;
     
     // Use the best difficulty found across both workers
-    combined.best_difficulty = (stats_worker0.best_difficulty > stats_worker1.best_difficulty) 
-                                ? stats_worker0.best_difficulty 
-                                : stats_worker1.best_difficulty;
+    if(stats_worker0.best_difficulty > stats_worker1.best_difficulty) {
+        combined.best_difficulty = stats_worker0.best_difficulty;
+        combined.best_difficulty_zeros = stats_worker0.best_difficulty_zeros;
+        memcpy(combined.best_hash, stats_worker0.best_hash, 65);
+    } else {
+        combined.best_difficulty = stats_worker1.best_difficulty;
+        combined.best_difficulty_zeros = stats_worker1.best_difficulty_zeros;
+        memcpy(combined.best_hash, stats_worker1.best_hash, 65);
+    }
     
     // Sum blocks found
     combined.blocks_found = stats_worker0.blocks_found + stats_worker1.blocks_found;
