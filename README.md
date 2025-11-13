@@ -291,6 +291,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
+- **[NerdMiner_v2](https://github.com/BitMaker-hub/NerdMiner_v2)** - Primary reference for Bitcoin mining optimizations and SHA-256 performance implementations. The optimized `nerdSHA256plus` library and dual-core mining architecture used in this project are based on NerdMiner's excellent work.
 - Bitcoin Core developers
 - Bitcoin Cash community
 - Duino-Coin project

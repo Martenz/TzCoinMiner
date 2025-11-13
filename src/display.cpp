@@ -735,9 +735,17 @@ void display_page_mining(bool miningActive, bool wifiConnected, const char* time
             }
             drawText(line3, statusTextX, statsY + lineSpacing * 2, white, statsScale, false);
             
-            // Line 4: Shares (accepted/rejected)
+            // Line 4: Shares (submitted/accepted) in K format with no decimals (rounded)
             char line4[32];
-            snprintf(line4, sizeof(line4), "shares: %u/%u", stats.shares_accepted, stats.shares_rejected);
+            if (!isSoloMode) {
+                uint32_t submitted_k = (stats.shares_submitted + 500) / 1000;  // Round to nearest K
+                uint32_t accepted_k = (stats.shares_accepted + 500) / 1000;
+                snprintf(line4, sizeof(line4), "shares: %uK/%uK", submitted_k, accepted_k);
+            } else {
+                uint32_t accepted_k = (stats.shares_accepted + 500) / 1000;
+                uint32_t rejected_k = (stats.shares_rejected + 500) / 1000;
+                snprintf(line4, sizeof(line4), "shares: %uK/%uK", accepted_k, rejected_k);
+            }
             drawText(line4, statusTextX, statsY + lineSpacing * 3, white, statsScale, false);
             
             // Line 5: Blocks found

@@ -22,6 +22,9 @@ struct stratum_job_t {
 // Callback quando arriva un nuovo job
 typedef void (*stratum_job_callback_t)(stratum_job_t* job);
 
+// Callback quando arriva risposta a una share (accepted=true/false)
+typedef void (*stratum_share_response_callback_t)(bool accepted);
+
 // Inizializza il client Stratum
 void stratum_init(const char* pool_url, uint16_t port, const char* wallet_address, 
                   const char* worker_name = nullptr, const char* password = nullptr);
@@ -44,6 +47,9 @@ bool stratum_submit_share(const char* job_id, const char* extranonce2,
 
 // Imposta callback per nuovi job
 void stratum_set_job_callback(stratum_job_callback_t callback);
+
+// Imposta callback per risposte alle share
+void stratum_set_share_response_callback(stratum_share_response_callback_t callback);
 
 // Ottieni difficoltà corrente
 uint32_t stratum_get_difficulty();

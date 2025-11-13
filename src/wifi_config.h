@@ -19,6 +19,7 @@ struct WifiConfig {
     char ducoUsername[64];  // Duino-Coin username
     char ducoMiningKey[64]; // Duino-Coin mining key (optional)
     char timezone[64];      // Timezone string (e.g., "CET-1CEST,M3.5.0,M10.5.0/3")
+    uint32_t minDifficulty; // Minimum difficulty for share submission (0 = use pool default)
     bool soloMode;          // true = solo mining, false = pool mining
     bool useDuinoCoin;      // true = mine Duino-Coin, false = mine Bitcoin/BCH
     bool useBitcoinCash;    // true = mine Bitcoin Cash, false = mine Bitcoin (only when useDuinoCoin=false)

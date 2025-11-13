@@ -1,4 +1,5 @@
 #include "stratum_client.h"
+#include "wifi_config.h"
 #include <WiFi.h>
 #include <ArduinoJson.h>
 #include "esp_log.h"
@@ -31,8 +32,15 @@ static bool stratum_clean_jobs = false;
 
 static uint32_t stratum_difficulty = 0;
 
+// Keepalive per mantenere connessione attiva
+static unsigned long last_keepalive_time = 0;
+static unsigned long last_activity_time = 0;
+static const unsigned long KEEPALIVE_INTERVAL = 60000;  // 60 secondi
+static const unsigned long CONNECTION_TIMEOUT = 300000;  // 5 minuti senza attività = timeout
+
 // Callback per mining task
 static stratum_job_callback_t job_callback = nullptr;
+static stratum_share_response_callback_t share_response_callback = nullptr;
 
 // Helper: converti hex string a bytes
 static void hex_to_bytes(const String& hex, uint8_t* bytes, size_t len) {
@@ -83,7 +91,10 @@ static bool stratum_read_response(JsonDocument& doc) {
         return false;
     }
     
-    ESP_LOGI(TAG, "Received: %s", line.c_str());
+    // Log RAW per debug (commentato per performance)
+    // Serial.print("[STRATUM RX] ");
+    // Serial.println(line);
+    // ESP_LOGI(TAG, "Received: %s", line.c_str());
     
     DeserializationError error = deserializeJson(doc, line);
     if (error) {
@@ -147,6 +158,7 @@ static void stratum_process_difficulty(JsonArray params) {
     float diff = params[0].as<float>();
     stratum_difficulty = (uint32_t)diff;
     
+    Serial.printf("🎚️  Pool set difficulty to: %u\n", stratum_difficulty);
     ESP_LOGI(TAG, "Difficulty set to: %u", stratum_difficulty);
 }
 
@@ -178,7 +190,11 @@ bool stratum_connect() {
     ESP_LOGI(TAG, "Connected to pool");
     stratum_connected = true;
     
-    // Invia mining.subscribe
+    // Inizializza timestamp per keepalive
+    last_keepalive_time = millis();
+    last_activity_time = millis();
+    
+    // Invia mining.subscribe (il suggest_difficulty si manda DOPO authorize)
     JsonDocument doc;
     doc["id"] = 1;
     doc["method"] = "mining.subscribe";
@@ -211,88 +227,170 @@ void stratum_loop() {
         return;
     }
     
-    // Leggi eventuali messaggi dal pool
-    JsonDocument doc;
-    if (!stratum_read_response(doc)) {
+    unsigned long now = millis();
+    
+    // Verifica timeout connessione (nessuna attività da troppo tempo)
+    if (now - last_activity_time > CONNECTION_TIMEOUT) {
+        ESP_LOGW(TAG, "Connection timeout - no activity for %lu seconds", CONNECTION_TIMEOUT / 1000);
+        Serial.println("⚠️  Timeout connessione - riconnessione...");
+        stratum_disconnect();
         return;
     }
     
-    // Risposta a una nostra richiesta
-    if (!doc["id"].isNull()) {
-        int id = doc["id"].as<int>();
+    // Invia keepalive se necessario (ogni 60 secondi)
+    if (now - last_keepalive_time > KEEPALIVE_INTERVAL) {
+        // Invia un messaggio mining.ping per mantenere la connessione attiva
+        JsonDocument keepalive_doc;
+        keepalive_doc["id"] = 999;  // ID speciale per keepalive
+        keepalive_doc["method"] = "mining.ping";
+        keepalive_doc["params"].to<JsonArray>();  // Array vuoto
         
-        // Risposta a mining.subscribe
-        if (id == 1) {
-            if (!doc["error"].isNull()) {
-                ESP_LOGE(TAG, "Subscribe error");
-                stratum_disconnect();
-                return;
+        if (stratum_send_message(keepalive_doc)) {
+            ESP_LOGI(TAG, "Keepalive sent");
+            last_keepalive_time = now;
+        } else {
+            ESP_LOGW(TAG, "Keepalive failed - connection may be dead");
+            stratum_disconnect();
+            return;
+        }
+    }
+    
+    // Leggi messaggi dal pool (max 5 per chiamata per non bloccare mining)
+    int messages_read = 0;
+    const int MAX_MESSAGES_PER_CALL = 5;
+    while (stratum_tcp_client.available() && messages_read < MAX_MESSAGES_PER_CALL) {
+        messages_read++;
+        JsonDocument doc;
+        if (!stratum_read_response(doc)) {
+            continue;  // Messaggio invalido, prova il prossimo
+        }
+        
+        // Aggiorna timestamp ultima attività (abbiamo ricevuto qualcosa)
+        last_activity_time = now;
+        
+        // Risposta a una nostra richiesta
+        if (!doc["id"].isNull()) {
+            int id = doc["id"].as<int>();
+            // Serial.printf("[STRATUM] Response ID: %d\n", id);
+            // ESP_LOGI(TAG, "Received response with ID: %d", id);
+            
+            // Risposta a keepalive (ignora)
+            if (id == 999) {
+                // ESP_LOGI(TAG, "Keepalive response received");
+                continue;  // Processa prossimo messaggio
             }
             
-            JsonArray result = doc["result"].as<JsonArray>();
-            if (result.size() >= 2) {
-                stratum_extranonce1 = result[1].as<String>();
-                stratum_extranonce2_size = result[2].as<int>();
+            // Risposta a mining.subscribe
+            if (id == 1) {
+                if (!doc["error"].isNull()) {
+                    ESP_LOGE(TAG, "Subscribe error");
+                    stratum_disconnect();
+                    return;  // Errore grave, esci
+                }
                 
-                ESP_LOGI(TAG, "Subscribed - extranonce1: %s, extranonce2_size: %d", 
-                         stratum_extranonce1.c_str(), stratum_extranonce2_size);
+                JsonArray result = doc["result"].as<JsonArray>();
+                if (result.size() >= 2) {
+                    stratum_extranonce1 = result[1].as<String>();
+                    stratum_extranonce2_size = result[2].as<int>();
+                    
+                    ESP_LOGI(TAG, "Subscribed - extranonce1: %s, extranonce2_size: %d", 
+                             stratum_extranonce1.c_str(), stratum_extranonce2_size);
+                    
+                    // Invia mining.authorize
+                    JsonDocument auth_doc;
+                    auth_doc["id"] = 2;
+                    auth_doc["method"] = "mining.authorize";
+                    JsonArray auth_params = auth_doc["params"].to<JsonArray>();
+                    auth_params.add(stratum_wallet + "." + stratum_worker);
+                    auth_params.add(stratum_password);
+                    
+                    stratum_send_message(auth_doc);
+                }
+            }
+            // Risposta a mining.authorize
+            else if (id == 2) {
+                if (!doc["error"].isNull()) {
+                    ESP_LOGE(TAG, "Authorization failed");
+                    stratum_disconnect();
+                    return;  // Errore grave, esci
+                }
                 
-                // Invia mining.authorize
-                JsonDocument auth_doc;
-                auth_doc["id"] = 2;
-                auth_doc["method"] = "mining.authorize";
-                JsonArray auth_params = auth_doc["params"].to<JsonArray>();
-                auth_params.add(stratum_wallet + "." + stratum_worker);
-                auth_params.add(stratum_password);
-                
-                stratum_send_message(auth_doc);
-            }
-        }
-        // Risposta a mining.authorize
-        else if (id == 2) {
-            if (!doc["error"].isNull()) {
-                ESP_LOGE(TAG, "Authorization failed");
-                stratum_disconnect();
-                return;
-            }
-            
-            bool authorized = doc["result"].as<bool>();
-            if (authorized) {
-                ESP_LOGI(TAG, "Authorized successfully");
-            } else {
-                ESP_LOGE(TAG, "Not authorized");
-                stratum_disconnect();
-            }
-        }
-        // Risposta a mining.submit
-        else if (id == 3) {
-            if (!doc["error"].isNull()) {
-                ESP_LOGW(TAG, "Share rejected");
-            } else {
-                bool accepted = doc["result"].as<bool>();
-                if (accepted) {
-                    ESP_LOGI(TAG, "Share accepted!");
+                bool authorized = doc["result"].as<bool>();
+                if (authorized) {
+                    Serial.println("[STRATUM] Authorized successfully!");
+                    ESP_LOGI(TAG, "Authorized successfully");
+                    
+                    // Invia mining.suggest_difficulty per ESP32
+                    extern WifiConfig config;
+                    uint32_t suggest_diff = (config.minDifficulty > 0) ? config.minDifficulty : 64;
+                    
+                    Serial.printf("[STRATUM] Sending mining.suggest_difficulty: %u\n", suggest_diff);
+                    ESP_LOGI(TAG, "Sending mining.suggest_difficulty with value: %u", suggest_diff);
+                    
+                    JsonDocument suggest_doc;
+                    suggest_doc["id"] = 99;  // ID univoco (3 è usato per mining.submit)
+                    suggest_doc["method"] = "mining.suggest_difficulty";
+                    JsonArray suggest_params = suggest_doc["params"].to<JsonArray>();
+                    suggest_params.add(suggest_diff);
+                    
+                    stratum_send_message(suggest_doc);
+                    ESP_LOGI(TAG, "Suggested difficulty: %u", suggest_diff);
                 } else {
-                    ESP_LOGW(TAG, "Share not accepted");
+                    ESP_LOGE(TAG, "Not authorized");
+                    stratum_disconnect();
+                    return;  // Non autorizzato, esci
+                }
+            }
+            // Risposta a mining.submit
+            else if (id == 3) {
+                if (!doc["error"].isNull()) {
+                    // Serial.println("❌ SHARE REJECTED BY POOL!");
+                    // String error = doc["error"].as<String>();
+                    // Serial.printf("   Error: %s\n", error.c_str());
+                    // ESP_LOGW(TAG, "Share rejected: %s", error.c_str());
+                    // Notifica mining_task
+                    if (share_response_callback) {
+                        share_response_callback(false);  // rejected
+                    }
+                } else {
+                    bool accepted = doc["result"].as<bool>();
+                    if (accepted) {
+                        Serial.println("✅ SHARE ACCEPTED BY POOL!");
+                        ESP_LOGI(TAG, "Share accepted!");
+                    } else {
+                        // Serial.println("⚠️  SHARE NOT ACCEPTED BY POOL!");
+                        // ESP_LOGW(TAG, "Share not accepted");
+                    }
+                    // Notifica mining_task
+                    if (share_response_callback) {
+                        share_response_callback(accepted);
+                    }
                 }
             }
         }
-    }
-    // Notifica dal pool
-    else if (!doc["method"].isNull()) {
-        String method = doc["method"].as<String>();
-        JsonArray params = doc["params"].as<JsonArray>();
-        
-        if (method == "mining.notify") {
-            stratum_process_notify(params);
+        // Notifica dal pool
+        else if (!doc["method"].isNull()) {
+            String method = doc["method"].as<String>();
+            JsonArray params = doc["params"].as<JsonArray>();
+            
+            if (method == "mining.notify") {
+                stratum_process_notify(params);
+            }
+            else if (method == "mining.set_difficulty") {
+                stratum_process_difficulty(params);
+            }
         }
-        else if (method == "mining.set_difficulty") {
-            stratum_process_difficulty(params);
-        }
-    }
+    }  // Fine while (stratum_tcp_client.available())
 }
 
 bool stratum_submit_share(const char* job_id, const char* extranonce2, const char* ntime, const char* nonce) {
+    // Verifica connessione TCP prima di tentare submit
+    if (!stratum_tcp_client.connected()) {
+        ESP_LOGE(TAG, "TCP connection lost before submit");
+        stratum_connected = false;
+        return false;
+    }
+    
     if (!stratum_is_connected()) {
         ESP_LOGE(TAG, "Not connected");
         return false;
@@ -308,11 +406,18 @@ bool stratum_submit_share(const char* job_id, const char* extranonce2, const cha
     params.add(ntime);
     params.add(nonce);
     
+    // Aggiorna timestamp attività quando inviamo share
+    last_activity_time = millis();
+    
     return stratum_send_message(doc);
 }
 
 void stratum_set_job_callback(stratum_job_callback_t callback) {
     job_callback = callback;
+}
+
+void stratum_set_share_response_callback(stratum_share_response_callback_t callback) {
+    share_response_callback = callback;
 }
 
 uint32_t stratum_get_difficulty() {

@@ -21,6 +21,9 @@ bool isApMode = false;  // Track if AP mode is active
 bool isSoloMode = false;  // Track if solo mining mode is configured
 bool isDuinoCoinMode = false;  // Track if Duino-Coin mode is configured
 
+// Monitor task handle
+TaskHandle_t monitorTaskHandle = NULL;
+
 // Button state tracking
 struct ButtonState {
     bool lastReading;
@@ -32,6 +35,57 @@ struct ButtonState {
 
 ButtonState button1State = {HIGH, false, 0, 0, false};
 ButtonState button2State = {HIGH, false, 0, 0, false};
+
+// Monitor task - handles display updates
+// Runs on Core 1 with priority 5 (like NerdMiner)
+void runMonitor(void* parameter) {
+    Serial.println("[MONITOR] Task started on core " + String(xPortGetCoreID()));
+    
+    unsigned long lastDisplayUpdate = 0;
+    unsigned long lastTimeUpdate = 0;
+    
+    while (true) {
+        unsigned long currentMillis = millis();
+        
+        // Update display at 50fps during logo page, 1fps otherwise
+        unsigned long displayUpdateInterval = (currentPage == PAGE_LOGO) ? 20 : 1000;
+        
+        if (currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
+            lastDisplayUpdate = currentMillis;
+            
+            bool wifiConnected = (wifi_get_status() == WIFI_CONNECTED);
+            String timeString = wifi_get_time_string();
+            
+            // Refresh current page
+            switch(currentPage) {
+                case PAGE_LOGO:
+                    display_page_logo(wifiConnected, timeString.c_str(), miningActive, isSoloMode, isDuinoCoinMode);
+                    break;
+                case PAGE_MINING:
+                    // Only update mining page every second
+                    if (currentMillis - lastTimeUpdate >= 1000) {
+                        display_page_mining(miningActive, wifiConnected, timeString.c_str(), isSoloMode, isDuinoCoinMode);
+                    }
+                    break;
+                case PAGE_SETUP:
+                    // Only update setup page every second
+                    if (currentMillis - lastTimeUpdate >= 1000) {
+                        display_page_setup(wifiEnabled, wifiConnected, timeString.c_str(), miningActive, isSoloMode, isDuinoCoinMode);
+                    }
+                    break;
+            }
+            
+            // Update time counter
+            if (currentMillis - lastTimeUpdate >= 1000) {
+                lastTimeUpdate = currentMillis;
+            }
+        }
+        
+        // Yield every 50ms (like NerdMiner)
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
+
 
 void setup()
 {
@@ -127,6 +181,24 @@ void setup()
     Serial.println("Button 1 (BOOT): Switch pages");
     Serial.println("Button 2 (GPIO21): Page actions");
     Serial.println("=======================\n");
+    
+    // Create monitor task on Core 1 with priority 5 (like NerdMiner)
+    Serial.println("Creating Monitor task...");
+    BaseType_t monitorResult = xTaskCreatePinnedToCore(
+        runMonitor,           // Task function
+        "Monitor",            // Task name
+        10000,                // Stack size (10KB like NerdMiner)
+        NULL,                 // Parameters
+        5,                    // Priority (5 like NerdMiner)
+        &monitorTaskHandle,   // Task handle
+        1                     // Core 1
+    );
+    
+    if (monitorResult == pdPASS) {
+        Serial.println("Monitor task created successfully on Core 1");
+    } else {
+        Serial.println("ERROR: Failed to create Monitor task!");
+    }
 }
 
 void handleButton1() 
@@ -381,7 +453,8 @@ void checkButtons()
 
 void loop()
 {
-    unsigned long currentMillis = millis();
+    // Simplified loop - only handle buttons and web server
+    // Display updates now handled by Monitor task on Core 1
     
     // Check for button presses
     checkButtons();
@@ -391,71 +464,13 @@ void loop()
         wifi_handle_client();
     }
     
-    // Update display every second when WiFi is connected to show time
-    // BUT update more frequently during logo page animation
-    static unsigned long lastTimeUpdate = 0;
-    static unsigned long lastDisplayUpdate = 0;
-    
-    // Update display at 50fps during logo page, 1fps otherwise
-    unsigned long displayUpdateInterval = (currentPage == PAGE_LOGO) ? 20 : 1000;
-    
-    if (currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
-        lastDisplayUpdate = currentMillis;
-        
-        bool wifiConnected = (wifi_get_status() == WIFI_CONNECTED);
-        String timeString = wifi_get_time_string();
-        
-        // Refresh current page
-        switch(currentPage) {
-            case PAGE_LOGO:
-                display_page_logo(wifiConnected, timeString.c_str(), miningActive, isSoloMode, isDuinoCoinMode);
-                break;
-            case PAGE_MINING:
-                // Only update mining page every second
-                if (currentMillis - lastTimeUpdate >= 1000) {
-                    display_page_mining(miningActive, wifiConnected, timeString.c_str(), isSoloMode, isDuinoCoinMode);
-                }
-                break;
-            case PAGE_SETUP:
-                // Only update setup page every second
-                if (currentMillis - lastTimeUpdate >= 1000) {
-                    display_page_setup(wifiEnabled, wifiConnected, timeString.c_str(), miningActive, isSoloMode, isDuinoCoinMode);
-                }
-                break;
-        }
-        
-        // Update time counter
-        if (currentMillis - lastTimeUpdate >= 1000) {
-            lastTimeUpdate = currentMillis;
-        }
+    // Update mining active state based on actual task status
+    if (isDuinoCoinMode) {
+        miningActive = duino_task_is_running();
+    } else {
+        miningActive = mining_task_is_running();
     }
     
-    // Main application loop - keep system running
-    static unsigned long lastHeartbeat = 0;
-    
-    // Print heartbeat every 10 seconds
-    if (currentMillis - lastHeartbeat >= 10000) {
-        lastHeartbeat = currentMillis;
-        Serial.println("TzCoinMiner - System running normally");
-        Serial.printf("Uptime: %lu seconds\n", currentMillis / 1000);
-        
-        // Print WiFi status
-        WifiStatus status = wifi_get_status();
-        if (status == WIFI_CONNECTED) {
-            Serial.printf("WiFi: Connected to %s\n", WiFi.SSID().c_str());
-        } else if (status == WIFI_AP_MODE) {
-            Serial.println("WiFi: AP Mode Active (192.168.4.1)");
-        } else {
-            Serial.println("WiFi: Disconnected");
-        }
-        
-        // Update mining active state based on actual task status
-        if (isDuinoCoinMode) {
-            miningActive = duino_task_is_running();
-        } else {
-            miningActive = mining_task_is_running();
-        }
-    }
-    
-    delay(10);  // Small delay for responsiveness
+    // Yield to other tasks (50ms like NerdMiner)
+    vTaskDelay(50 / portTICK_PERIOD_MS);
 }

@@ -296,6 +296,22 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
                 </div>
                 
                 <div class="form-group">
+                    <label for="minDifficulty">⚙️ Minimum Share Difficulty (ESP32 Optimization)</label>
+                    <select id="minDifficulty" name="minDifficulty" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        <option value="0" %MIN_DIFF_0%>Auto (Pool Default) - Let pool decide</option>
+                        <option value="4" %MIN_DIFF_4%>Very Low (4) - ~Every 1 sec - May cause disconnects</option>
+                        <option value="64" %MIN_DIFF_64%>Low (64) - ~Every 30 sec - For testing</option>
+                        <option value="256" %MIN_DIFF_256%>Medium (256) - ~Every 2 min - Recommended</option>
+                        <option value="512" %MIN_DIFF_512%>High (512) - ~Every 5 min - Stable connection</option>
+                        <option value="1024" %MIN_DIFF_1024%>Very High (1024) - ~Every 10 min - Max stability</option>
+                    </select>
+                    <small style="color: #666; display: block; margin-top: 5px;">
+                        Higher difficulty = fewer shares but more stable connection. <br>
+                        Recommended: 256-512 for ESP32 to avoid pool disconnects.
+                    </small>
+                </div>
+                
+                <div class="form-group">
                     <label for="btcWallet">💰 Bitcoin (BTC) Wallet Address</label>
                     <input type="text" id="btcWallet" name="btcWallet" value="%BTC_WALLET%" placeholder="bc1q... or 1...">
                 </div>
@@ -476,6 +492,14 @@ String getHtmlPage() {
     html.replace("%DUCO_CHECKED%", currentConfig.useDuinoCoin ? "checked" : "");
     html.replace("%AUTO_START_CHECKED%", currentConfig.autoStartMining ? "checked" : "");
     
+    // Minimum Difficulty selection
+    html.replace("%MIN_DIFF_0%", currentConfig.minDifficulty == 0 ? "selected" : "");
+    html.replace("%MIN_DIFF_4%", currentConfig.minDifficulty == 4 ? "selected" : "");
+    html.replace("%MIN_DIFF_64%", currentConfig.minDifficulty == 64 ? "selected" : "");
+    html.replace("%MIN_DIFF_256%", currentConfig.minDifficulty == 256 ? "selected" : "");
+    html.replace("%MIN_DIFF_512%", currentConfig.minDifficulty == 512 ? "selected" : "");
+    html.replace("%MIN_DIFF_1024%", currentConfig.minDifficulty == 1024 ? "selected" : "");
+    
     // Timezone selection
     html.replace("%TZ_EUROPE_ROME%", strcmp(currentConfig.timezone, "CET-1CEST,M3.5.0,M10.5.0/3") == 0 ? "selected" : "");
     html.replace("%TZ_EUROPE_LONDON%", strcmp(currentConfig.timezone, "GMT0BST,M3.5.0/1,M10.5.0") == 0 ? "selected" : "");
@@ -548,6 +572,9 @@ void handleSave() {
     }
     if (server.hasArg("poolPassword")) {
         strncpy(currentConfig.poolPassword, server.arg("poolPassword").c_str(), sizeof(currentConfig.poolPassword) - 1);
+    }
+    if (server.hasArg("minDifficulty")) {
+        currentConfig.minDifficulty = server.arg("minDifficulty").toInt();
     }
     if (server.hasArg("btcWallet")) {
         strncpy(currentConfig.btcWallet, server.arg("btcWallet").c_str(), sizeof(currentConfig.btcWallet) - 1);
@@ -897,6 +924,7 @@ bool wifi_load_config(WifiConfig &config) {
     if (strlen(config.timezone) == 0) {
         strcpy(config.timezone, "CET-1CEST,M3.5.0,M10.5.0/3");
     }
+    config.minDifficulty = preferences.getUInt("minDiff", 0);  // 0 = use pool default
     config.soloMode = preferences.getBool("soloMode", false);
     config.useDuinoCoin = preferences.getBool("useDuco", false);
     config.useBitcoinCash = preferences.getBool("useBCH", false);
@@ -921,6 +949,7 @@ bool wifi_save_config(const WifiConfig &config) {
     preferences.putString("ducoUser", config.ducoUsername);
     preferences.putString("ducoKey", config.ducoMiningKey);
     preferences.putString("timezone", config.timezone);
+    preferences.putUInt("minDiff", config.minDifficulty);
     preferences.putBool("soloMode", config.soloMode);
     preferences.putBool("useDuco", config.useDuinoCoin);
     preferences.putBool("useBCH", config.useBitcoinCash);

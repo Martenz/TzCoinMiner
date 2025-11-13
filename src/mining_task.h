@@ -9,8 +9,9 @@ struct MiningStats {
     uint32_t total_hashes;
     uint32_t best_difficulty;
     char best_hash[65]; // SHA256 hash as hex string
-    uint32_t shares_accepted;
-    uint32_t shares_rejected;
+    uint32_t shares_submitted;  // Total shares submitted to pool
+    uint32_t shares_accepted;   // Shares accepted by pool
+    uint32_t shares_rejected;   // Shares rejected by pool
     uint32_t blocks_found;  // Number of blocks found
     uint32_t block_height;  // Current block height being mined
 };

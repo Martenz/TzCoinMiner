@@ -1,21 +1,31 @@
 #include "mining_task.h"
 #include "bitcoin_rpc.h"
 #include "stratum_client.h"
-#include "mbedtls/sha256.h"
+#include "wifi_config.h"
+#include "shaLib/sha256_hard.h"     // Wrapper con midstate support
+#include "shaLib/nerdSHA256plus.h"  // NerdMiner optimized SHA
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_task_wdt.h>  // For explicit watchdog reset
 
-// FreeRTOS task handle
+// Forward declarations
+int difficulty_to_zeros(uint32_t difficulty);
+
+// FreeRTOS task handles
 static TaskHandle_t miningTaskHandle = NULL;
+static TaskHandle_t miningTaskHandle2 = NULL;  // Second worker for dual-core mining
+static TaskHandle_t stratumTaskHandle = NULL;
 
-// Task running flag
+// Task running flags
 static volatile bool taskRunning = false;
+static volatile bool stratumTaskRunning = false;
 
 // Educational fallback flag (when Solo/Pool connection fails)
 static volatile bool isEducationalFallback = false;
 
-// Mining statistics
-static MiningStats stats = {0};
+// Mining statistics - separate for each worker
+static MiningStats stats_worker0 = {0};
+static MiningStats stats_worker1 = {0};
 
 // Mining mode
 static MiningMode currentMiningMode = MINING_MODE_EDUCATIONAL;
@@ -27,10 +37,11 @@ static String pool_wallet;
 static String pool_worker;
 static String pool_password;
 
-// Current pool job
+// Job corrente dal pool
 static stratum_job_t current_pool_job;
 static bool has_pool_job = false;
-static uint32_t pool_difficulty = 1;
+static bool need_rebuild_header = false;  // Flag per ricostruire header solo su nuovo job
+static uint32_t pool_difficulty = 0;
 static uint32_t extranonce2 = 0;  // Counter for extranonce2
 
 // Bitcoin block header structure (80 bytes)
@@ -77,31 +88,40 @@ void on_stratum_job(stratum_job_t* job) {
     // Salva il job corrente
     current_pool_job = *job;
     has_pool_job = true;
+    need_rebuild_header = true;  // Segnala che serve ricostruire header
     
-    // Aggiorna difficoltà
+    // Aggiorna difficoltà dal pool
     pool_difficulty = stratum_get_difficulty();
-    Serial.printf("   Difficulty: %u\n", pool_difficulty);
+    
+    // Mostra difficulty effettiva (usa minDifficulty se pool_difficulty è 0)
+    uint32_t effective = pool_difficulty;
+    extern WifiConfig config;
+    if(effective == 0 && config.minDifficulty > 0) {
+        effective = config.minDifficulty;
+    }
+    if(effective == 0) {
+        effective = 1; // Fallback minimo
+    }
+    
+    Serial.printf("   Pool Difficulty: %u (effettiva: %u, richiede %d zeros)\n", 
+                 pool_difficulty, effective, difficulty_to_zeros(effective));
 }
 
-// Calcola SHA-256 doppio (come richiesto da Bitcoin)
-void double_sha256(const uint8_t* input, size_t length, uint8_t* output) {
-    uint8_t temp_hash[32];
-    
-    // Primo SHA-256
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0); // 0 = SHA-256 (non SHA-224)
-    mbedtls_sha256_update(&ctx, input, length);
-    mbedtls_sha256_finish(&ctx, temp_hash);
-    mbedtls_sha256_free(&ctx);
-    
-    // Secondo SHA-256
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
-    mbedtls_sha256_update(&ctx, temp_hash, 32);
-    mbedtls_sha256_finish(&ctx, output);
-    mbedtls_sha256_free(&ctx);
+// Callback quando arriva risposta dal pool per una share
+void on_share_response(bool accepted) {
+    // Update stats in worker0 (shares are submitted by stratum task, not worker-specific)
+    if (accepted) {
+        stats_worker0.shares_accepted++;
+        // Serial.printf("   📊 Stats: %u accepted / %u submitted / %u rejected\n", 
+        //              stats_worker0.shares_accepted, stats_worker0.shares_submitted, stats_worker0.shares_rejected);
+    } else {
+        stats_worker0.shares_rejected++;
+        // Serial.printf("   📊 Stats: %u accepted / %u submitted / %u rejected\n", 
+        //              stats_worker0.shares_accepted, stats_worker0.shares_submitted, stats_worker0.shares_rejected);
+    }
 }
+
+// Nota: double_sha256 ora viene da sha256_hard.cpp (hardware accelerated)
 
 // Conta gli zeri iniziali in un hash (in formato esadecimale)
 int count_leading_zeros(const uint8_t* hash) {
@@ -118,6 +138,48 @@ int count_leading_zeros(const uint8_t* hash) {
     }
     return leading_zeros;
 }
+
+// Calcola la difficoltà effettiva da usare (max tra pool e minima configurata)
+uint32_t get_effective_difficulty() {
+    extern WifiConfig config;
+    
+    // Se pool_difficulty è 0 (pool non ha ancora inviato difficulty)
+    // usa minDifficulty configurato come fallback (o default 1)
+    if (pool_difficulty == 0) {
+        uint32_t fallback = (config.minDifficulty > 0) ? config.minDifficulty : 1;
+        return fallback;
+    }
+    
+    // Se il pool ha inviato una difficulty, USALA SEMPRE (il pool sa cosa fa)
+    // NON applicare floor hardware, lascia che sia il pool a decidere
+    return pool_difficulty;
+}
+
+// Approssimazione: converte difficoltà in zeri richiesti
+// Basato su: difficulty ≈ 2^(zeros * 4) / 65536
+// Diff 1 = ~8 zeros, Diff 4 = ~9 zeros, Diff 256 = ~12 zeros, Diff 65536 = ~16 zeros
+// TEMPORANEO: difficulty abbassate DRASTICAMENTE per TEST FINALE
+// Converte difficulty in numero di zeri richiesti nell'hash
+int difficulty_to_zeros(uint32_t difficulty) {
+    // Bitcoin difficulty to leading zero BITS (not bytes!)
+    // Difficulty 1 = target with 32 leading zero bits = 8 leading zero NIBBLES (hex digits)
+    // Each nibble is 4 bits, so 32 bits = 8 hex digits
+    // count_leading_zeros counts NIBBLES (hex digits), not bytes
+    
+    if(difficulty <= 1) return 8;          // diff 1 = 32 zero bits = 8 hex digits
+    if(difficulty <= 4) return 10;         // diff 4 = ~40 zero bits
+    if(difficulty <= 16) return 11;        // diff 16 
+    if(difficulty <= 64) return 12;        // diff 64
+    if(difficulty <= 256) return 13;       // diff 256
+    if(difficulty <= 1024) return 14;      // diff 1K
+    if(difficulty <= 4096) return 15;      // diff 4K
+    if(difficulty <= 16384) return 16;     // diff 16K
+    if(difficulty <= 65536) return 17;     // diff 64K
+    if(difficulty <= 262144) return 18;    // diff 256K
+    if(difficulty <= 1048576) return 19;   // diff 1M
+    return 20; // Qualsiasi altra difficoltà
+}
+
 
 // Costruisce la coinbase transaction da componenti Stratum
 void build_coinbase(const stratum_job_t* job, uint32_t extranonce2_value, uint8_t* coinbase_hash) {
@@ -148,7 +210,8 @@ void build_coinbase(const stratum_job_t* job, uint32_t extranonce2_value, uint8_
         sscanf(job->coinb2.c_str() + (i * 2), "%2hhx", &coinbase[coinbase_len++]);
     }
     
-    // Calcola doppio SHA-256 della coinbase
+    // ⚡ Calcola doppio SHA-256 della coinbase con HW acceleration
+    // Coinbase è quasi sempre >64 bytes, usa versione generica
     double_sha256(coinbase, coinbase_len, coinbase_hash);
 }
 
@@ -162,7 +225,8 @@ void calculate_merkle_root(uint8_t* coinbase_hash, const std::vector<String>& me
         uint8_t branch_hash[32];
         uint8_t combined[64];
         
-        // Converti branch element da hex a binary
+        // Converti branch element da hex a binary (come NerdMinerV2)
+        // NON invertire - gli elementi vengono usati così come arrivano
         for(int j = 0; j < 32; j++) {
             sscanf(merkle_branch[i].c_str() + (j * 2), "%2hhx", &branch_hash[j]);
         }
@@ -171,8 +235,8 @@ void calculate_merkle_root(uint8_t* coinbase_hash, const std::vector<String>& me
         memcpy(combined, merkle_root, 32);
         memcpy(combined + 32, branch_hash, 32);
         
-        // Doppio SHA-256 del risultato
-        double_sha256(combined, 64, merkle_root);
+        // ⚡ Doppio SHA-256 del risultato con HW acceleration (ottimizzato per 64 byte)
+        sha256_double_hash_64(combined, merkle_root);
     }
 }
 
@@ -190,13 +254,43 @@ bool check_hash_difficulty(const uint8_t* hash, uint32_t difficulty_bits) {
     return leading_zeros >= required_zeros;
 }
 
+// Stratum network task - gestisce comunicazione pool in background
+void stratumTask(void* parameter)
+{
+    Serial.println("🌐 Stratum network task started on Core 0");
+    
+    stratumTaskRunning = true;
+    
+    while (stratumTaskRunning) {
+        if (currentMiningMode == MINING_MODE_POOL && stratum_is_connected()) {
+            stratum_loop();
+        }
+        
+        // Breve delay per non saturare CPU (10ms)
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    
+    Serial.println("Stratum network task stopped");
+    stratumTaskHandle = NULL;
+    vTaskDelete(NULL);
+}
+
 // Mining task function - runs in background
 void miningTask(void* parameter)
 {
-    Serial.println("╔════════════════════════════════════════════════════════╗");
-    Serial.println("║          BITCOIN MINING TASK STARTED                  ║");
-    Serial.println("╚════════════════════════════════════════════════════════╝");
+    // Get worker ID from parameter (0 or 1)
+    int worker_id = (int)parameter;
+    
+    // Select the correct stats struct for this worker
+    MiningStats* stats = (worker_id == 0) ? &stats_worker0 : &stats_worker1;
+    
+    Serial.printf("╔════════════════════════════════════════════════════════╗\n");
+    Serial.printf("║    BITCOIN MINING WORKER %d STARTED (Core %d)         ║\n", worker_id, xPortGetCoreID());
+    Serial.printf("╚════════════════════════════════════════════════════════╝\n");
     Serial.println();
+    
+    // Skip SHA-256 test until midstate is calculated (after pool job received)
+    // Test will run automatically during first mining loop
     
     taskRunning = true;
     
@@ -213,6 +307,7 @@ void miningTask(void* parameter)
         stratum_init(pool_url.c_str(), pool_port, pool_wallet.c_str(), 
                     pool_worker.c_str(), pool_password.c_str());
         stratum_set_job_callback(on_stratum_job);
+        stratum_set_share_response_callback(on_share_response);
         
         // Connetti al pool
         if(!stratum_connect()) {
@@ -269,7 +364,7 @@ void miningTask(void* parameter)
             hex_to_bin(blockTemplate.merkleroot, header.merkleRoot, 32);
             
             // Salva block height nelle statistiche
-            stats.block_height = blockTemplate.height;
+            stats->block_height = blockTemplate.height;
             
             usingRealBlock = true;
             
@@ -312,11 +407,15 @@ void miningTask(void* parameter)
         header.nonce = 0;
         
         // Block height educativo (simulato)
-        stats.block_height = 0;
+        stats->block_height = 0;
         
         Serial.printf("   Version: 0x%08x\n", header.version);
         Serial.printf("   Difficulty bits: 0x%08x\n", header.bits);
         Serial.printf("   Timestamp: %u\n", header.timestamp);
+        
+        // 🚀 CRITICAL: Pre-calculate midstate for educational mode too!
+        calc_midstate((uint8_t*)&header);
+        
         Serial.println();
         Serial.println("⛏️  Iniziando mining loop...");
         Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -328,14 +427,27 @@ void miningTask(void* parameter)
     uint32_t hashes = 0;
     uint32_t start_time = millis();
     uint32_t blocks_found = 0;
-    int best_zeros = 0;
+    int best_zeros = 0;  // Best del periodo corrente (si resetta ogni 1000 batches)
+    
+    // Best assoluto (globale, non si resetta mai)
+    int absolute_best_zeros = 0;
+    char absolute_best_hash[65] = {0};
+    
+    // Block header per pool mining (persistente tra iterazioni)
+    BlockHeader pool_header;
+    bool header_initialized = false;
+    
+    // 🔥 DUAL-WORKER: Each worker starts with different nonce
+    // Worker 0: starts at 0 (even nonces: 0, 2, 4, 6, ...)
+    // Worker 1: starts at 1 (odd nonces: 1, 3, 5, 7, ...)
+    uint32_t nonce = worker_id;
+    
+    Serial.printf("⚡ Worker %d: Starting with nonce %u (will increment by 2)\n", worker_id, nonce);
     
     // Main mining loop
     while (taskRunning) {
-        // MODALITÀ POOL: gestisci messaggi Stratum
+        // MODALITÀ POOL: verifica connessione (stratum_loop ora gira in task separato!)
         if(currentMiningMode == MINING_MODE_POOL) {
-            stratum_loop();
-            
             // Se non connesso, riprova
             if(!stratum_is_connected()) {
                 Serial.println("⚠️  Connessione pool persa, riconnessione...");
@@ -353,77 +465,218 @@ void miningTask(void* parameter)
                 continue;
             }
             
-            // Costruisci block header dal job Stratum
-            BlockHeader pool_header;
-            
-            // Version (converti da hex string a uint32)
-            pool_header.version = strtoul(current_pool_job.version.c_str(), NULL, 16);
-            
-            // Previous block hash (inverti byte order - little endian)
-            for(int i = 0; i < 32; i++) {
-                sscanf(current_pool_job.prev_hash.c_str() + (i * 2), "%2hhx", &pool_header.prevBlockHash[31 - i]);
-            }
-            
-            // Calcola merkle root corretto
-            // NOTA: Il calcolo del merkle root sembra avere problemi
-            // Per ora usiamo un valore random che funzionava prima
-            // uint8_t coinbase_hash[32];
-            // build_coinbase(&current_pool_job, extranonce2, coinbase_hash);
-            // calculate_merkle_root(coinbase_hash, current_pool_job.merkle_branch, pool_header.merkleRoot);
-            
-            // Merkle root random (temporaneo - funzionava prima)
-            for(int i = 0; i < 32; i++) {
-                pool_header.merkleRoot[i] = random(0, 256);
-            }
-            
-            // nBits (difficulty)
-            pool_header.bits = strtoul(current_pool_job.nbits.c_str(), NULL, 16);
-            
-            // Timestamp
-            pool_header.timestamp = strtoul(current_pool_job.ntime.c_str(), NULL, 16);
-            
-            // Nonce - inizia da 0 e incrementa
-            pool_header.nonce = 0;
-            
-            // Aggiorna block height (non fornito da Stratum, usa 0)
-            stats.block_height = 0;
-            
-            // Mina per un po' (prova 1M nonce prima di ricontrollare job per massimizzare hashrate)
-            for(int i = 0; i < 1000000 && taskRunning && has_pool_job; i++) {
-                pool_header.nonce++;
+            // Costruisci block header SOLO se è nuovo job o primo avvio
+            if(need_rebuild_header || !header_initialized) {
+                need_rebuild_header = false;
+                header_initialized = true;
                 
-                // Calcola doppio SHA-256
-                double_sha256((uint8_t*)&pool_header, sizeof(BlockHeader), hash);
+                // Version (converti da hex string a uint32)
+                pool_header.version = strtoul(current_pool_job.version.c_str(), NULL, 16);
                 
-                hashes++;
-                stats.total_hashes++;
-                
-                // Conta zeri per stats
-                int zeros = count_leading_zeros(hash);
-                if(zeros > best_zeros) {
-                    best_zeros = zeros;
-                    stats.best_difficulty = zeros;
-                    hash_to_hex(hash, hash_hex);
-                    memcpy(stats.best_hash, hash_hex, 65);
+                // Previous block hash (4-byte word swap come NerdMinerV2)
+                // Il pool invia in formato RPC, dobbiamo convertire per Bitcoin
+                // Prima leggi tutti i byte direttamente
+                uint8_t prev_hash_temp[32];
+                for(int i = 0; i < 32; i++) {
+                    sscanf(current_pool_job.prev_hash.c_str() + (i * 2), "%2hhx", &prev_hash_temp[i]);
                 }
                 
-                // Controlla se hash è valido per la difficoltà del pool
-                // Per ESP32, accettiamo qualsiasi hash con almeno 4 zeri iniziali
-                // Un vero pool userebbe la difficoltà target corretta
-                int required_zeros = 4;  // Molto basso per permettere all'ESP32 di trovare shares
-                if(zeros >= required_zeros) {
+                // Poi fai 4-byte word swap (8 parole da 4 byte)
+                for(int i = 0; i < 8; i++) {
+                    for(int j = 0; j < 4; j++) {
+                        pool_header.prevBlockHash[i * 4 + j] = prev_hash_temp[i * 4 + (3 - j)];
+                    }
+                }
+                
+                // nBits (difficulty)
+                pool_header.bits = strtoul(current_pool_job.nbits.c_str(), NULL, 16);
+                
+                // Timestamp
+                pool_header.timestamp = strtoul(current_pool_job.ntime.c_str(), NULL, 16);
+                
+                // Nonce - inizia da 0 e incrementa
+                pool_header.nonce = 0;
+                
+                // Aggiorna block height (non fornito da Stratum, usa 0)
+                stats->block_height = 0;
+                
+                // Debug: mostra block header completo solo al primo job
+                static bool first_job = true;
+                if(first_job) {
+                    first_job = false;
+                    Serial.printf("🔨 Mining job configurato (diff %u richiede %d zeros)\n", 
+                                 get_effective_difficulty(), difficulty_to_zeros(get_effective_difficulty()));
+                    char header_hex[161];
+                    bin_to_hex((uint8_t*)&pool_header, 80, header_hex);
+                    Serial.printf("   Header sample (80 bytes): %s\n", header_hex);
+                }
+            }  // Fine if(need_rebuild_header)
+            
+            // ⚠️ IMPORTANTE: Ricalcola merkle root quando necessario
+            static uint32_t last_extranonce2 = 0xFFFFFFFF;
+            static String last_job_id = "";
+            bool need_recalc = false;
+            
+            // Ricalcola se:
+            // 1. Extranonce2 cambiato (dopo submit share)
+            // 2. Nuovo job ricevuto
+            // 3. Prima volta in assoluto (last_job_id vuoto)
+            if(extranonce2 != last_extranonce2 || 
+               current_pool_job.job_id != last_job_id ||
+               last_job_id.length() == 0) {
+                need_recalc = true;
+            }
+            
+            Serial.printf("DEBUG: job=%s, last_job=%s, ex2=%u, last_ex2=%u, need_recalc=%d\n", 
+                         current_pool_job.job_id.c_str(), last_job_id.c_str(),
+                         extranonce2, last_extranonce2, need_recalc);
+            
+            if(need_recalc) {
+                Serial.printf("🔄 Ricalcolo merkle root... (extranonce2=%u, job=%s)\n", 
+                             extranonce2, current_pool_job.job_id.c_str());
+                uint8_t coinbase_hash[32];
+                build_coinbase(&current_pool_job, extranonce2, coinbase_hash);
+                calculate_merkle_root(coinbase_hash, current_pool_job.merkle_branch, pool_header.merkleRoot);
+                
+                // 🚀 PERFORMANCE CRITICA: Pre-calcola midstate + bake!
+                calc_midstate((uint8_t*)&pool_header);
+                
+                last_extranonce2 = extranonce2;
+                last_job_id = current_pool_job.job_id;
+            } else {
+                Serial.println("✅ Merkle/midstate già calcolati, riuso valori!");
+            }
+            
+            // Loop continuo su TUTTI i nonces senza ricalcolare merkle!
+            // Statistiche ogni NONCE_TEST_BATCH per monitoraggio
+            const uint32_t NONCE_TEST_BATCH = 5000000;  // 5M nonces tra stats
+            uint32_t batch_end = nonce + NONCE_TEST_BATCH;
+            uint32_t batch_start_time = millis();
+            uint32_t batch_hashes = 0;  // Conta hash in questo batch
+            bool first_stats_sent = false;  // Flag per primo aggiornamento rapido stats
+            
+            // ⚡ OTTIMIZZAZIONE CRITICA: Pre-calcola valori fuori dal loop
+            uint32_t effective_diff = get_effective_difficulty();
+            int required_zeros = difficulty_to_zeros(effective_diff);
+            const int MIN_ZEROS_THRESHOLD = 1;
+            int effective_zeros_needed = (required_zeros > MIN_ZEROS_THRESHOLD) ? required_zeros : MIN_ZEROS_THRESHOLD;
+            
+            Serial.printf("⛏️  Worker %d batch: %u nonces, diff=%u, zeros=%d, starting nonce=%u\n", 
+                         worker_id, NONCE_TEST_BATCH, effective_diff, effective_zeros_needed, nonce);
+            
+            // Salva job_id corrente per verificare se cambia durante il batch
+            String current_job_id = current_pool_job.job_id;
+            
+            // 🚀 PERFORMANCE CRITICAL: Prepare data buffer for optimized mining
+            // NerdMiner approach: modify only nonce bytes, keep rest constant
+            uint8_t header_bytes[80];
+            memcpy(header_bytes, &pool_header, 80);
+            
+            // Performance test: measure 10K hashes
+            uint32_t perf_test_start = micros();
+            const uint32_t PERF_TEST_COUNT = 10000;
+            
+            // 🔥 DUAL-WORKER OPTIMIZATION: Step by 2, each worker handles even/odd nonces
+            // Worker 0: 0, 2, 4, 6, 8, ...
+            // Worker 1: 1, 3, 5, 7, 9, ...
+            const uint32_t nonce_step = 2;
+            
+            for(; nonce < batch_end && taskRunning; nonce += nonce_step) {
+                // ⚡ OTTIMIZZAZIONE CRITICA: Modifica SOLO i 4 bytes del nonce (offset 76)
+                ((uint32_t*)(header_bytes + 76))[0] = nonce;
+                
+                // ⚡ CHIAVE: Usa sha256_double_hash_80 con midstate pre-calcolato!
+                sha256_double_hash_80(header_bytes, hash);
+                
+                // Performance measurement
+                if(batch_hashes == PERF_TEST_COUNT) {
+                    uint32_t perf_elapsed = micros() - perf_test_start;
+                    uint32_t perf_khash = (PERF_TEST_COUNT * 1000000ULL) / perf_elapsed / 1000;
+                    Serial.printf("⚡ PERF TEST: %u hashes in %u μs = %u KH/s\n", 
+                                 PERF_TEST_COUNT, perf_elapsed, perf_khash);
+                }
+                
+                batch_hashes++;
+                stats->total_hashes++;
+                
+                // � EARLY STATS UPDATE: Calcola hashrate dopo primo milione per feedback rapido
+                if(!first_stats_sent && batch_hashes >= 1000000) {
+                    uint32_t early_elapsed = millis() - batch_start_time;
+                    if(early_elapsed > 0) {
+                        stats->hashes_per_second = ((uint64_t)batch_hashes * 1000ULL) / early_elapsed;
+                        Serial.printf("📊 Early stats (1M hashes): %u H/s (%.1f KH/s)\n",
+                                     stats->hashes_per_second, stats->hashes_per_second / 1000.0);
+                    }
+                    first_stats_sent = true;
+                }
+                
+                // �🔧 WATCHDOG FIX: Yield every 8K hashes (safer for slower speeds)
+                // At 33 KH/s: 8K hashes = ~242ms work
+                // Light yield (1 tick ~10ms) = ~4% overhead
+                if((batch_hashes % 8000) == 0) {
+                    vTaskDelay(1 / portTICK_PERIOD_MS);  // Yield 1 tick only
+                    esp_task_wdt_reset();  // Explicit watchdog reset
+                }
+                
+                // ⚡ OTTIMIZZAZIONE 1: Quick check PRIMA di invertire byte!
+                // Se hash[31] != 0, impossibile avere 1+ zero → skip tutto
+                if(hash[31] != 0) continue;
+                
+                // ⚡ OTTIMIZZAZIONE 2: Reverse solo se hash promettente
+                uint8_t hash_reversed[32];
+                for(int j = 0; j < 32; j++) {
+                    hash_reversed[j] = hash[31 - j];
+                }
+                
+                // Conta zeri solo ora
+                int zeros = count_leading_zeros(hash_reversed);
+                
+                // Aggiorna best assoluto solo se migliora
+                if(zeros > absolute_best_zeros) {
+                    absolute_best_zeros = zeros;
+                    hash_to_hex(hash_reversed, hash_hex);
+                    memcpy(absolute_best_hash, hash_hex, 65);
+                    stats->best_difficulty = zeros;
+                    memcpy(stats->best_hash, hash_hex, 65);
+                    
+                    if(zeros >= 4) {
+                        Serial.printf("🎯 New best: %d zeros - Hash: %s\n", zeros, hash_hex);
+                    }
+                }
+                
+                // Aggiorna best periodo
+                if(zeros > best_zeros) {
+                    best_zeros = zeros;
+                }
+                
+                // Controlla se è valido per share submission
+                if(zeros >= effective_zeros_needed) {
+                    char share_hash_hex[65];
+                    hash_to_hex(hash_reversed, share_hash_hex);
+                    
                     Serial.println("⭐ SHARE TROVATA!");
                     Serial.printf("   Nonce: 0x%08x\n", pool_header.nonce);
-                    Serial.printf("   Hash: %s\n", hash_hex);
-                    Serial.printf("   Zeros: %d (required: %d)\n", zeros, required_zeros);
+                    Serial.printf("   Hash: %s\n", share_hash_hex);
+                    Serial.printf("   Zeros: %d (pool requires: %d for diff %u)\n", 
+                                 zeros, required_zeros, effective_diff);
                     Serial.printf("   Extranonce2: 0x%08x\n", extranonce2);
                     
-                    // Prepara dati per submit
+                    // Prepara dati per submit (CORRETTO byte order come NerdMiner)
                     char nonce_hex[9];
-                    snprintf(nonce_hex, sizeof(nonce_hex), "%08x", pool_header.nonce);
+                    // IMPORTANTE: Nonce in little-endian per Stratum
+                    snprintf(nonce_hex, sizeof(nonce_hex), "%02x%02x%02x%02x",
+                             (pool_header.nonce >> 0) & 0xFF,
+                             (pool_header.nonce >> 8) & 0xFF,
+                             (pool_header.nonce >> 16) & 0xFF,
+                             (pool_header.nonce >> 24) & 0xFF);
                     
                     char ntime_hex[9];
-                    snprintf(ntime_hex, sizeof(ntime_hex), "%08x", pool_header.timestamp);
+                    // IMPORTANTE: Ntime in little-endian per Stratum
+                    snprintf(ntime_hex, sizeof(ntime_hex), "%02x%02x%02x%02x",
+                             (pool_header.timestamp >> 0) & 0xFF,
+                             (pool_header.timestamp >> 8) & 0xFF,
+                             (pool_header.timestamp >> 16) & 0xFF,
+                             (pool_header.timestamp >> 24) & 0xFF);
                     
                     // Converte extranonce2 in hex string (little endian)
                     char extranonce2_hex[17];
@@ -433,34 +686,69 @@ void miningTask(void* parameter)
                     }
                     extranonce2_hex[hex_len] = '\0';
                     
+                    // Incrementa share submitted PRIMA di inviare
+                    stats->shares_submitted++;
+                    
                     // Invia share al pool
-                    if(stratum_submit_share(current_pool_job.job_id.c_str(), 
-                                           extranonce2_hex, ntime_hex, nonce_hex)) {
-                        Serial.println("✅ Share accettata!");
-                        stats.shares_accepted++;
+                    bool sent = stratum_submit_share(current_pool_job.job_id.c_str(), 
+                                           extranonce2_hex, ntime_hex, nonce_hex);
+                    
+                    if(sent) {
+                        Serial.println("📤 Share inviata al pool (attendo conferma...)");
                     } else {
-                        Serial.println("❌ Share rifiutata");
-                        stats.shares_rejected++;
+                        Serial.println("❌ Errore invio share (TCP failed)");
+                        stats->shares_rejected++;
                     }
                     
-                    // Incrementa extranonce2 per la prossima share
+                    // Incrementa extranonce2 per la prossima share e ricalcola merkle
                     extranonce2++;
-                    
-                    // Ricomincia con nuovo nonce
-                    break;
-                }
+                    break;  // Esci dal batch e ricalcola merkle root
+                }  // Fine if(zeros >= effective_zeros_needed)
+            }  // Fine for nonce loop
+            
+            // Calcola hashrate dopo ogni batch
+            uint32_t batch_elapsed = millis() - batch_start_time;
+            if(batch_elapsed > 0) {
+                // FIX: Use uint64_t to avoid overflow with large batch_hashes
+                stats->hashes_per_second = ((uint64_t)batch_hashes * 1000ULL) / batch_elapsed;
             }
             
-            // Aggiorna hash rate ogni secondo
-            uint32_t elapsed = millis() - start_time;
-            if(elapsed >= 1000) {
-                stats.hashes_per_second = (hashes * 1000) / elapsed;
-                hashes = 0;
-                start_time = millis();
+            Serial.printf("DEBUG HASHRATE: batch_hashes=%u, elapsed=%u, calculated=%u\n",
+                         batch_hashes, batch_elapsed, stats->hashes_per_second);
+            
+            // Ogni batch completato (o overflow nonce), incrementa extranonce2
+            if(nonce == 0) {  // Overflow dopo 4.3 miliardi
+                extranonce2++;
             }
             
-            continue;
-        }
+            // Log statistiche ogni 1 batch (ogni 5M nonces)
+            static uint32_t total_batches = 0;
+            total_batches++;
+            
+            Serial.println("\n╔══════════════════════════════════════════════════════════╗");
+            Serial.println("║              📊 MINING STATISTICS                       ║");
+            Serial.println("╚══════════════════════════════════════════════════════════╝");
+            Serial.printf("  Batch #%u completed\n", total_batches);
+            Serial.printf("  Current nonce:    %u (%.1f%%)\n", nonce, (nonce / 42949672.96));
+            Serial.printf("  ⚡ Hashrate:       %u H/s (%.1f KH/s)\n", 
+                         stats->hashes_per_second, stats->hashes_per_second / 1000.0);
+            Serial.printf("  Batch time:       %u ms (%.1f sec)\n", batch_elapsed, batch_elapsed / 1000.0);
+            Serial.printf("  Batch hashes:     %u\n", batch_hashes);
+            Serial.printf("  Total hashes:     %u\n", stats->total_hashes);
+            Serial.printf("  Absolute best:    %u zeros\n", absolute_best_zeros);
+            if(absolute_best_zeros > 0) {
+                Serial.printf("  Best hash:        %s\n", absolute_best_hash);
+            }
+            Serial.printf("  Shares submitted: %u\n", stats->shares_submitted);
+            Serial.printf("  Shares accepted:  %u\n", stats->shares_accepted);
+            Serial.printf("  Shares rejected:  %u\n", stats->shares_rejected);
+            Serial.printf("  Pool difficulty:  %u (requires %d zeros)\n", 
+                         get_effective_difficulty(), difficulty_to_zeros(get_effective_difficulty()));
+            Serial.printf("  Uptime:           %u seconds\n", millis() / 1000);
+            Serial.println("════════════════════════════════════════════════════════════\n");
+            
+            continue;  // Torna all'inizio del while loop
+        }  // Fine if(currentMiningMode == MINING_MODE_POOL)
         
         // MODALITÀ SOLO/EDUCATIONAL: mining classico
         // Incrementa il nonce per ogni tentativo
@@ -471,21 +759,35 @@ void miningTask(void* parameter)
         double_sha256((uint8_t*)&header, sizeof(BlockHeader), hash);
         
         hashes++;
-        stats.total_hashes++;
+        stats->total_hashes++;
+        
+        // 🔧 WATCHDOG FIX: Yield every 8K hashes in educational mode too
+        if((hashes % 8000) == 0) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
+        }
+        
+        // Aggiorna hashrate ogni 100 hash per display reattivo
+        if((stats->total_hashes % 100) == 0) {
+            uint32_t elapsed = millis() - start_time;
+            if(elapsed > 0) {
+                stats->hashes_per_second = (hashes * 1000) / elapsed;
+            }
+        }
         
         // Conta zeri iniziali per statistiche
         int zeros = count_leading_zeros(hash);
         if(zeros > best_zeros) {
             best_zeros = zeros;
-            stats.best_difficulty = zeros;
-            hash_to_hex(hash, stats.best_hash);
+            stats->best_difficulty = zeros;
+            hash_to_hex(hash, stats->best_hash);
         }
         
         // Verifica se abbiamo trovato un hash valido
         if(check_hash_difficulty(hash, header.bits)) {
             hash_to_hex(hash, hash_hex);
             blocks_found++;
-            stats.blocks_found = blocks_found;  // Update global stats
+            stats->blocks_found = blocks_found;  // Update global stats
             
             Serial.println();
             Serial.println("╔════════════════════════════════════════════════════════╗");
@@ -521,10 +823,9 @@ void miningTask(void* parameter)
             }
         }
         
-        // Statistiche ogni secondo
+        // Reset contatori ogni secondo per evitare overflow
         uint32_t elapsed = millis() - start_time;
-        if(elapsed >= 1000 && hashes > 0) {
-            stats.hashes_per_second = (hashes * 1000) / elapsed;
+        if(elapsed >= 1000) {
             
             // Stampa stats solo ogni 5 secondi per ridurre overhead seriale
             static uint32_t last_print = 0;
@@ -533,9 +834,9 @@ void miningTask(void* parameter)
                 
                 Serial.println("┌─────────────────────────────────────────────────────────┐");
                 Serial.printf("│ ⚡ Hash/s: %-8u  📊 Nonce: %-12u      │\n", 
-                    stats.hashes_per_second, header.nonce);
+                    stats->hashes_per_second, header.nonce);
                 Serial.printf("│ 🔢 Totale: %-10u ⏱️  Tempo: %-4u sec        │\n", 
-                    stats.total_hashes, elapsed/1000);
+                    stats->total_hashes, elapsed/1000);
                 Serial.printf("│ 🏆 Blocchi: %-2u        🎯 Miglior: %d zeri         │\n",
                     blocks_found, best_zeros);
                 Serial.println("├─────────────────────────────────────────────────────────┤");
@@ -557,7 +858,7 @@ void miningTask(void* parameter)
     Serial.println("║           MINING TASK STOPPED                         ║");
     Serial.println("╚════════════════════════════════════════════════════════╝");
     Serial.printf("📊 Statistiche finali:\n");
-    Serial.printf("   Totale hash calcolati: %u\n", stats.total_hashes);
+    Serial.printf("   Totale hash calcolati: %u\n", stats->total_hashes);
     Serial.printf("   Blocchi trovati: %u\n", blocks_found);
     Serial.printf("   Miglior difficoltà: %d zeri iniziali\n", best_zeros);
     
@@ -570,8 +871,14 @@ void miningTask(void* parameter)
     Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     Serial.println();
     
-    // Delete this task
-    miningTaskHandle = NULL;
+    // Delete this task and clear handle based on worker ID
+    if (worker_id == 0) {
+        Serial.printf("Worker %d exiting, clearing handle\n", worker_id);
+        miningTaskHandle = NULL;
+    } else {
+        Serial.printf("Worker %d exiting, clearing handle 2\n", worker_id);
+        miningTaskHandle2 = NULL;
+    }
     vTaskDelete(NULL);
 }
 
@@ -584,68 +891,137 @@ void mining_task_start(void)
         return;
     }
     
-    // Reset statistiche
-    memset(&stats, 0, sizeof(MiningStats));
+    // Reset statistiche per entrambi i worker
+    memset(&stats_worker0, 0, sizeof(MiningStats));
+    memset(&stats_worker1, 0, sizeof(MiningStats));
     
-    // Create FreeRTOS task
-    // Task name: "MiningTask"
-    // Stack size: 8192 bytes (aumentato per crypto operations)
-    // Priority: 1 (low priority, won't interfere with WiFi and display)
-    // Core: 1 (run on second core to keep main loop on core 0)
-    xTaskCreatePinnedToCore(
+    // Create FreeRTOS tasks with NerdMiner architecture:
+    // 1. Stratum network task on Core 1, priority 4 (like NerdMiner)
+    // 2. Two mining workers unpinned, priority 1 (like NerdMiner)
+    
+    // Crea task stratum se siamo in modalità pool
+    if (currentMiningMode == MINING_MODE_POOL) {
+        xTaskCreatePinnedToCore(
+            stratumTask,           // Task function
+            "Stratum",             // Task name
+            12000,                 // Stack size (12KB like NerdMiner)
+            NULL,                  // Task parameter
+            4,                     // Priority 4 (like NerdMiner)
+            &stratumTaskHandle,    // Task handle
+            1                      // Core 1 (like NerdMiner, with Monitor)
+        );
+        
+        if (stratumTaskHandle != NULL) {
+            Serial.println("✅ Stratum task created on Core 1, priority 4");
+        } else {
+            Serial.println("❌ ERROR: Cannot create stratum task!");
+        }
+    }
+    
+    // 🚀 DUAL-THREADED MINING (NerdMiner architecture)
+    // Create two mining workers, unpinned, priority 1
+    // Worker 0: even nonces (0, 2, 4, 6, ...)
+    // Worker 1: odd nonces (1, 3, 5, 7, ...)
+    
+    Serial.println("Creating dual mining workers (NerdMiner architecture)...");
+    
+    xTaskCreate(
         miningTask,           // Task function
-        "MiningTask",         // Task name
-        8192,                 // Stack size (bytes) - aumentato per operazioni crypto
-        NULL,                 // Task parameter
-        1,                    // Priority (1 = low)
-        &miningTaskHandle,    // Task handle
-        1                     // Core ID (1 = second core)
+        "MinerSw-0",          // Task name (like NerdMiner)
+        8192,                 // Stack size (8KB)
+        (void*)0,             // Worker ID = 0 (even nonces)
+        1,                    // Priority 1 (like NerdMiner)
+        &miningTaskHandle     // Task handle
     );
     
     if (miningTaskHandle != NULL) {
-        Serial.println("✅ Mining task creato con successo su Core 1");
+        Serial.println("✅ MinerSw-0 created (priority 1, unpinned)");
     } else {
-        Serial.println("❌ ERRORE: Impossibile creare mining task!");
+        Serial.println("❌ ERROR: Cannot create MinerSw-0!");
+        return;
+    }
+    
+    xTaskCreate(
+        miningTask,           // Task function
+        "MinerSw-1",          // Task name (like NerdMiner)
+        8192,                 // Stack size (8KB)
+        (void*)1,             // Worker ID = 1 (odd nonces)
+        1,                    // Priority 1 (like NerdMiner)
+        &miningTaskHandle2    // Task handle
+    );
+    
+    if (miningTaskHandle2 != NULL) {
+        Serial.println("✅ MinerSw-1 created (priority 1, unpinned)");
+    } else {
+        Serial.println("❌ ERROR: Cannot create MinerSw-1!");
     }
 }
 
 // Stop the mining task
 void mining_task_stop(void)
 {
-    if (miningTaskHandle == NULL) {
+    if (miningTaskHandle == NULL && miningTaskHandle2 == NULL && stratumTaskHandle == NULL) {
         Serial.println("⚠️  Mining task non in esecuzione");
         return;
     }
     
-    Serial.println("⏹️  Fermando mining task...");
+    Serial.println("⏹️  Fermando mining tasks...");
     
-    // Signal the task to stop
+    // Signal all tasks to stop
     taskRunning = false;
+    stratumTaskRunning = false;
     
-    // Wait for the task to clean up
-    while(miningTaskHandle != NULL) {
+    // Wait for mining workers to clean up
+    while(miningTaskHandle != NULL || miningTaskHandle2 != NULL) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
     
-    Serial.println("✅ Mining task fermato");
+    // Wait for stratum task to clean up
+    while(stratumTaskHandle != NULL) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    Serial.println("✅ Mining tasks fermati");
 }
 
 // Check if mining task is running
 bool mining_task_is_running(void)
 {
-    return (miningTaskHandle != NULL && taskRunning);
+    return ((miningTaskHandle != NULL || miningTaskHandle2 != NULL) && taskRunning);
 }
 
 // Get current mining statistics
 MiningStats mining_get_stats(void)
 {
-    return stats;
+    // Combine stats from both workers
+    MiningStats combined = {0};
+    
+    // Sum hashrates from both workers
+    combined.hashes_per_second = stats_worker0.hashes_per_second + stats_worker1.hashes_per_second;
+    
+    // Sum total hashes
+    combined.total_hashes = stats_worker0.total_hashes + stats_worker1.total_hashes;
+    
+    // Use the best difficulty found across both workers
+    combined.best_difficulty = (stats_worker0.best_difficulty > stats_worker1.best_difficulty) 
+                                ? stats_worker0.best_difficulty 
+                                : stats_worker1.best_difficulty;
+    
+    // Sum blocks found
+    combined.blocks_found = stats_worker0.blocks_found + stats_worker1.blocks_found;
+    
+    // Sum shares
+    combined.shares_submitted = stats_worker0.shares_submitted + stats_worker1.shares_submitted;
+    combined.shares_accepted = stats_worker0.shares_accepted + stats_worker1.shares_accepted;
+    combined.shares_rejected = stats_worker0.shares_rejected + stats_worker1.shares_rejected;
+    
+    return combined;
 }
 
 // Check if a block has been found
 bool mining_has_found_block(void)
 {
-    return stats.blocks_found > 0;
+    return (stats_worker0.blocks_found + stats_worker1.blocks_found) > 0;
 }
 
 // Configura nodo Bitcoin per mining SOLO
