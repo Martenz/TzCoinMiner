@@ -5,9 +5,9 @@
  * This provides ~20x performance over standard mbedtls
  */
 
+#include <Arduino.h>
 #include "sha256_hard.h"
 #include "nerdSHA256plus.h"
-#include <Arduino.h>
 #include <string.h>
 #include "mbedtls/sha256.h"
 

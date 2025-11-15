@@ -712,18 +712,15 @@ void display_page_mining(bool miningActive, bool wifiConnected, const char* time
             }
             drawText(line1, statusTextX, statsY, white, statsScale, false);
             
-            // Line 2: Best difficulty - show zeros (more intuitive) with difficulty in parentheses
+            // Line 2: Best difficulty - show zeros from both cores
             char line2[32];
-            if (stats.best_difficulty_zeros > 0) {
-                // Show zeros count with difficulty
-                if (stats.best_difficulty < 1000.0) {
-                    snprintf(line2, sizeof(line2), "best: %uz (%.0f)", 
-                            stats.best_difficulty_zeros, stats.best_difficulty);
-                } else {
-                    snprintf(line2, sizeof(line2), "best: %uz", stats.best_difficulty_zeros);
-                }
+            int core0_zeros = 0, core1_zeros = 0;
+            mining_get_dual_core_stats(&core0_zeros, &core1_zeros);
+            
+            if (core0_zeros > 0 || core1_zeros > 0) {
+                snprintf(line2, sizeof(line2), "best: %uz - %uz", core0_zeros, core1_zeros);
             } else {
-                snprintf(line2, sizeof(line2), "best: 0z");
+                snprintf(line2, sizeof(line2), "best: 0z - 0z");
             }
             drawText(line2, statusTextX, statsY + lineSpacing, white, statsScale, false);
             
@@ -733,10 +730,18 @@ void display_page_mining(bool miningActive, bool wifiConnected, const char* time
                 // Solo mode with real block height from RPC
                 snprintf(line3, sizeof(line3), "block: %u", stats.block_height);
             } else if (!isSoloMode) {
-                // Pool mode - show pool difficulty or working status
-                if (stats.shares_accepted > 0 || stats.shares_rejected > 0) {
+                // Pool mode - show connection status based on activity
+                if (stats.shares_accepted > 0) {
+                    // Have accepted shares = actively mining with successful submissions
                     snprintf(line3, sizeof(line3), "pool: active");
+                } else if (stats.shares_submitted > 0 || stats.shares_rejected > 0) {
+                    // Have submitted shares (even if rejected) = connected and trying
+                    snprintf(line3, sizeof(line3), "pool: connected");
+                } else if (stats.pool_connected) {
+                    // Received job but not submitted shares yet = connected, mining
+                    snprintf(line3, sizeof(line3), "pool: connected");
                 } else {
+                    // No job received yet = still connecting
                     snprintf(line3, sizeof(line3), "pool: connecting");
                 }
             } else {
@@ -745,16 +750,31 @@ void display_page_mining(bool miningActive, bool wifiConnected, const char* time
             }
             drawText(line3, statusTextX, statsY + lineSpacing * 2, white, statsScale, false);
             
-            // Line 4: Shares (submitted/accepted) in K format with no decimals (rounded)
+            // Line 4: Shares (submitted/accepted) with smart formatting
+            // Show simple numbers until 999, then switch to K format
             char line4[32];
             if (!isSoloMode) {
-                uint32_t submitted_k = (stats.shares_submitted + 500) / 1000;  // Round to nearest K
-                uint32_t accepted_k = (stats.shares_accepted + 500) / 1000;
-                snprintf(line4, sizeof(line4), "shares: %uK/%uK", submitted_k, accepted_k);
+                // Pool mode: show submitted/accepted (includes heartbeat shares)
+                if (stats.shares_submitted < 1000 && stats.shares_accepted < 1000) {
+                    // Simple format for small numbers
+                    snprintf(line4, sizeof(line4), "shares: %u/%u", 
+                            stats.shares_submitted, stats.shares_accepted);
+                } else {
+                    // K format for larger numbers (rounded to nearest K)
+                    uint32_t submitted_k = (stats.shares_submitted + 500) / 1000;
+                    uint32_t accepted_k = (stats.shares_accepted + 500) / 1000;
+                    snprintf(line4, sizeof(line4), "shares: %uK/%uK", submitted_k, accepted_k);
+                }
             } else {
-                uint32_t accepted_k = (stats.shares_accepted + 500) / 1000;
-                uint32_t rejected_k = (stats.shares_rejected + 500) / 1000;
-                snprintf(line4, sizeof(line4), "shares: %uK/%uK", accepted_k, rejected_k);
+                // Solo mode: show accepted/rejected
+                if (stats.shares_accepted < 1000 && stats.shares_rejected < 1000) {
+                    snprintf(line4, sizeof(line4), "shares: %u/%u", 
+                            stats.shares_accepted, stats.shares_rejected);
+                } else {
+                    uint32_t accepted_k = (stats.shares_accepted + 500) / 1000;
+                    uint32_t rejected_k = (stats.shares_rejected + 500) / 1000;
+                    snprintf(line4, sizeof(line4), "shares: %uK/%uK", accepted_k, rejected_k);
+                }
             }
             drawText(line4, statusTextX, statsY + lineSpacing * 3, white, statsScale, false);
             

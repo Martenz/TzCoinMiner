@@ -6,6 +6,19 @@
 #define MINING_UTILS_H
 
 #include <Arduino.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+// NerdMiner utility functions for difficulty calculation
+double le256todouble(const void *target);
+double diff_from_target(const void *target);
+bool isSha256Valid(const void* sha256);
+uint32_t swab32(uint32_t v);
+
+// Macro for unlikely condition (optimization hint)
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 
 // Verifica target difficulty (come NerdMiner)
 inline bool check_valid(uint8_t* hash, uint8_t* target) {
@@ -53,3 +66,4 @@ inline void log_share_debug(const char* job_id, uint32_t nonce, uint32_t ntime,
 }
 
 #endif // MINING_UTILS_H
+

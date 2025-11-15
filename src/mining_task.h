@@ -15,6 +15,7 @@ struct MiningStats {
     uint32_t shares_rejected;   // Shares rejected by pool
     uint32_t blocks_found;  // Number of blocks found
     uint32_t block_height;  // Current block height being mined
+    bool pool_connected;    // Pool has sent job (connected, even if no shares yet)
 };
 
 // Mining modes
@@ -29,6 +30,7 @@ void mining_task_start(void);
 void mining_task_stop(void);
 bool mining_task_is_running(void);
 MiningStats mining_get_stats(void);
+void mining_get_dual_core_stats(int* core0_zeros, int* core1_zeros);  // Get best zeros from both cores
 bool mining_has_found_block(void);  // Check if a block has been found
 
 // Configurazione nodo Bitcoin per mining solo

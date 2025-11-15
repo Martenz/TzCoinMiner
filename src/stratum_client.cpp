@@ -31,6 +31,7 @@ static String stratum_ntime;
 static bool stratum_clean_jobs = false;
 
 static uint32_t stratum_difficulty = 0;
+static bool difficulty_was_set = false;
 
 // Keepalive per mantenere connessione attiva
 static unsigned long last_keepalive_time = 0;
@@ -91,10 +92,10 @@ static bool stratum_read_response(JsonDocument& doc) {
         return false;
     }
     
-    // Log RAW per debug (commentato per performance)
-    // Serial.print("[STRATUM RX] ");
-    // Serial.println(line);
-    // ESP_LOGI(TAG, "Received: %s", line.c_str());
+    // Log RAW per debug
+    Serial.print("[STRATUM RX] ");
+    Serial.println(line);
+    ESP_LOGI(TAG, "Received: %s", line.c_str());
     
     DeserializationError error = deserializeJson(doc, line);
     if (error) {
@@ -130,6 +131,20 @@ static void stratum_process_notify(JsonArray params) {
     
     ESP_LOGI(TAG, "New job: %s", stratum_job_id.c_str());
     
+    // 🔥 Se il pool non ha mai inviato mining.set_difficulty, 
+    // assumiamo che stia usando difficulty 1 (minima possibile)
+    // Questo check avviene su OGNI job per gestire pool che non inviano mai difficulty
+    if (stratum_difficulty == 0) {
+        extern WifiConfig config;
+        // Se il pool non specifica, proviamo a usare la minDifficulty configurata
+        // oppure 1 come default (Bitcoin difficulty baseline)
+        uint32_t default_diff = (config.minDifficulty > 0) ? config.minDifficulty : 1;
+        stratum_difficulty = default_diff;
+        difficulty_was_set = true;
+        Serial.printf("⚠️  Pool non ha inviato difficulty - usando default: %u\n", stratum_difficulty);
+        ESP_LOGW(TAG, "Pool didn't send difficulty - using default: %u", stratum_difficulty);
+    }
+    
     // Notifica il mining task se c'è un callback
     if (job_callback) {
         stratum_job_t job;
@@ -152,14 +167,16 @@ static void stratum_process_notify(JsonArray params) {
 // Processa mining.set_difficulty
 static void stratum_process_difficulty(JsonArray params) {
     if (params.size() < 1) {
+        ESP_LOGE(TAG, "Invalid difficulty params");
         return;
     }
     
     float diff = params[0].as<float>();
     stratum_difficulty = (uint32_t)diff;
+    difficulty_was_set = true;
     
     Serial.printf("🎚️  Pool set difficulty to: %u\n", stratum_difficulty);
-    ESP_LOGI(TAG, "Difficulty set to: %u", stratum_difficulty);
+    ESP_LOGI(TAG, "Pool set difficulty to: %u", stratum_difficulty);
 }
 
 void stratum_init(const char* pool_url, uint16_t port, const char* wallet_address, const char* worker_name, const char* password) {
@@ -215,6 +232,8 @@ void stratum_disconnect() {
         stratum_tcp_client.stop();
     }
     stratum_connected = false;
+    stratum_difficulty = 0;
+    difficulty_was_set = false;
     ESP_LOGI(TAG, "Disconnected");
 }
 
@@ -344,10 +363,19 @@ void stratum_loop() {
             // Risposta a mining.submit
             else if (id == 3) {
                 if (!doc["error"].isNull()) {
-                    // Serial.println("❌ SHARE REJECTED BY POOL!");
-                    // String error = doc["error"].as<String>();
-                    // Serial.printf("   Error: %s\n", error.c_str());
-                    // ESP_LOGW(TAG, "Share rejected: %s", error.c_str());
+                    Serial.println("❌ SHARE REJECTED BY POOL!");
+                    JsonVariant error = doc["error"];
+                    String error_msg;
+                    if (error.is<String>()) {
+                        error_msg = error.as<String>();
+                    } else if (error.is<JsonArray>()) {
+                        JsonArray err_arr = error.as<JsonArray>();
+                        if (err_arr.size() > 1) {
+                            error_msg = err_arr[1].as<String>();
+                        }
+                    }
+                    Serial.printf("   Error: %s\n", error_msg.c_str());
+                    ESP_LOGW(TAG, "Share rejected: %s", error_msg.c_str());
                     // Notifica mining_task
                     if (share_response_callback) {
                         share_response_callback(false);  // rejected
@@ -358,8 +386,8 @@ void stratum_loop() {
                         Serial.println("✅ SHARE ACCEPTED BY POOL!");
                         ESP_LOGI(TAG, "Share accepted!");
                     } else {
-                        // Serial.println("⚠️  SHARE NOT ACCEPTED BY POOL!");
-                        // ESP_LOGW(TAG, "Share not accepted");
+                        Serial.println("⚠️  SHARE NOT ACCEPTED BY POOL!");
+                        ESP_LOGW(TAG, "Share not accepted");
                     }
                     // Notifica mining_task
                     if (share_response_callback) {
@@ -387,14 +415,22 @@ bool stratum_submit_share(const char* job_id, const char* extranonce2, const cha
     // Verifica connessione TCP prima di tentare submit
     if (!stratum_tcp_client.connected()) {
         ESP_LOGE(TAG, "TCP connection lost before submit");
+        Serial.println("❌ TCP connection lost!");
         stratum_connected = false;
         return false;
     }
     
     if (!stratum_is_connected()) {
         ESP_LOGE(TAG, "Not connected");
+        Serial.println("❌ Stratum not connected!");
         return false;
     }
+    
+    Serial.println("📡 Submitting share to pool:");
+    Serial.printf("   Job ID: %s\n", job_id);
+    Serial.printf("   Extranonce2: %s\n", extranonce2);
+    Serial.printf("   Ntime: %s\n", ntime);
+    Serial.printf("   Nonce: %s\n", nonce);
     
     JsonDocument doc;
     doc["id"] = 3;
@@ -409,7 +445,14 @@ bool stratum_submit_share(const char* job_id, const char* extranonce2, const cha
     // Aggiorna timestamp attività quando inviamo share
     last_activity_time = millis();
     
-    return stratum_send_message(doc);
+    bool sent = stratum_send_message(doc);
+    if (sent) {
+        Serial.println("✅ Share message sent to pool, waiting for response...");
+    } else {
+        Serial.println("❌ Failed to send share message!");
+    }
+    
+    return sent;
 }
 
 void stratum_set_job_callback(stratum_job_callback_t callback) {

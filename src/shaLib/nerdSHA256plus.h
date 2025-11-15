@@ -14,10 +14,10 @@
 #ifndef nerdSHA256plus_H_
 #define nerdSHA256plus_H_
 
+#include <Arduino.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <esp_attr.h>
 
 
 struct nerdSHA256_context {

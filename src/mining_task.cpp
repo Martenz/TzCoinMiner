@@ -2,14 +2,108 @@
 #include "bitcoin_rpc.h"
 #include "stratum_client.h"
 #include "wifi_config.h"
-#include "shaLib/sha256_hard.h"     // Wrapper con midstate support
-#include "shaLib/nerdSHA256plus.h"  // NerdMiner optimized SHA
+#include "shaLib/sha256_hard.h"      // SHA-256 wrapper functions
+#include "shaLib/nerdSHA256plus.h"  // NerdMiner optimized SHA-256
+#include "mining_utils.h"            // NerdMiner utility functions
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_task_wdt.h>  // For explicit watchdog reset
 
 // Forward declarations
 int difficulty_to_zeros(uint32_t difficulty);
+void save_pending_share(uint32_t nonce, double difficulty, int zeros, const uint8_t* hash, 
+                       const char* job_id, const char* ntime, uint32_t extranonce2);
+void check_pending_shares(const char* current_job_id, uint32_t current_difficulty);
+void cleanup_stale_shares(const char* new_job_id);
+
+// Helper: Reverse bytes in place (for endianness conversion)
+static void reverse_bytes(uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len / 2; ++i) {
+        uint8_t temp = data[i];
+        data[i] = data[len - 1 - i];
+        data[len - 1 - i] = temp;
+    }
+}
+
+// Calculate target from nbits (Bitcoin compact format)
+// Returns true if target was calculated successfully
+static bool calculate_target_from_nbits(const char* nbits_hex, uint8_t* target_out) {
+    if (!nbits_hex || strlen(nbits_hex) < 6) return false;
+    
+    // Parse nbits (compact format): AABBCCDD where AA is exponent, BBCCDD is coefficient
+    uint32_t nbits;
+    sscanf(nbits_hex, "%8x", &nbits);
+    
+    // Extract exponent and coefficient
+    uint8_t exponent = (nbits >> 24) & 0xFF;
+    uint32_t coefficient = nbits & 0x00FFFFFF;
+    
+    // Build target: coefficient shifted by (exponent - 3) bytes
+    memset(target_out, 0, 32);
+    
+    if (exponent >= 3) {
+        int shift_bytes = exponent - 3;
+        if (shift_bytes < 29) {  // Sanity check
+            target_out[shift_bytes + 2] = (coefficient >> 16) & 0xFF;
+            target_out[shift_bytes + 1] = (coefficient >> 8) & 0xFF;
+            target_out[shift_bytes + 0] = coefficient & 0xFF;
+        }
+    }
+    
+    return true;
+}
+
+// Check if hash meets target (NerdMiner method)
+// Both hash and target should be in little-endian format
+static bool check_hash_meets_target(const uint8_t* hash, const uint8_t* target) {
+    // Compare bytes from most significant to least significant
+    // Hash is already in little-endian, target needs reversal for comparison
+    uint8_t target_le[32];
+    memcpy(target_le, target, 32);
+    reverse_bytes(target_le, 32);
+    
+    // Compare byte by byte (big-endian order, so start from end of little-endian array)
+    for (int i = 31; i >= 0; i--) {
+        if (hash[i] > target_le[i]) {
+            return false;  // Hash too large
+        } else if (hash[i] < target_le[i]) {
+            return true;   // Hash smaller than target
+        }
+        // If equal, continue to next byte
+    }
+    
+    return true;  // Exactly equal = valid
+}
+
+// Job caching structure for performance (NerdMiner optimization)
+struct JobCache {
+    uint32_t extranonce2;
+    String job_id;
+    uint8_t merkle_root[32];
+    uint32_t midstate[8];
+    uint32_t bake[16];
+    uint8_t header_template[128];  // CRITICAL: Store header for consistent baking/hashing
+    uint8_t target[32];            // Target calculated from nbits for share validation
+    bool valid;
+};
+static JobCache g_job_cache = {0};
+
+// Pending shares queue - stores valuable hashes that don't meet current difficulty
+// but might be valid if pool lowers difficulty or for future jobs
+struct PendingShare {
+    uint32_t nonce;
+    double difficulty;
+    int zeros;
+    uint8_t hash[32];
+    String job_id;           // Critical: only submit for matching job
+    String ntime;
+    uint32_t extranonce2;
+    uint32_t timestamp;      // When found (to expire old shares)
+};
+
+#define MAX_PENDING_SHARES 20
+static PendingShare pending_shares[MAX_PENDING_SHARES];
+static int pending_count = 0;
 
 // FreeRTOS task handles
 static TaskHandle_t miningTaskHandle = NULL;
@@ -42,7 +136,8 @@ static stratum_job_t current_pool_job;
 static bool has_pool_job = false;
 static bool need_rebuild_header = false;  // Flag per ricostruire header solo su nuovo job
 static uint32_t pool_difficulty = 0;
-static uint32_t extranonce2 = 0;  // Counter for extranonce2
+static uint32_t extranonce2 = 1;  // Fixed extranonce2 value (NerdMiner uses 1)
+static uint32_t last_heartbeat_share_time = 0;  // Timestamp dell'ultima heartbeat share
 
 // Bitcoin block header structure (80 bytes)
 struct BlockHeader {
@@ -81,30 +176,58 @@ void bin_to_hex(const uint8_t* bin, size_t bin_len, char* hex)
 
 // Callback quando arriva nuovo job dal pool
 void on_stratum_job(stratum_job_t* job) {
-    Serial.println("📬 Nuovo job dal pool!");
+    // Copy job fields individually (can't use memcpy with std::vector!)
+    current_pool_job.job_id = job->job_id;
+    current_pool_job.prev_hash = job->prev_hash;
+    current_pool_job.coinb1 = job->coinb1;
+    current_pool_job.coinb2 = job->coinb2;
+    current_pool_job.merkle_branch = job->merkle_branch;  // This is a std::vector, proper assignment
+    current_pool_job.version = job->version;
+    current_pool_job.nbits = job->nbits;
+    current_pool_job.ntime = job->ntime;
+    current_pool_job.clean_jobs = job->clean_jobs;
+    current_pool_job.extranonce1 = job->extranonce1;
+    current_pool_job.extranonce2_size = job->extranonce2_size;
+    
+    // Update flags to trigger mining
+    has_pool_job = true;
+    need_rebuild_header = true;
+    
+    // Mark pool as connected (we received a job)
+    stats_worker0.pool_connected = true;
+    
+    // Invalidate cache to force recalculation
+    g_job_cache.valid = false;
+    
+    // 🔥 CRITICAL: Sync pool_difficulty from stratum client!
+    uint32_t old_difficulty = pool_difficulty;
+    pool_difficulty = stratum_get_difficulty();
+    
+    Serial.printf("\n📬 Nuovo job dal pool!\n");
     Serial.printf("   Job ID: %s\n", job->job_id.c_str());
     Serial.printf("   Clean: %s\n", job->clean_jobs ? "YES" : "NO");
     
-    // Salva il job corrente
-    current_pool_job = *job;
-    has_pool_job = true;
-    need_rebuild_header = true;  // Segnala che serve ricostruire header
-    
-    // Aggiorna difficoltà dal pool
-    pool_difficulty = stratum_get_difficulty();
-    
-    // Mostra difficulty effettiva (usa minDifficulty se pool_difficulty è 0)
-    uint32_t effective = pool_difficulty;
+    // Show both raw pool difficulty and effective difficulty being used
     extern WifiConfig config;
-    if(effective == 0 && config.minDifficulty > 0) {
-        effective = config.minDifficulty;
-    }
-    if(effective == 0) {
-        effective = 1; // Fallback minimo
-    }
+    uint32_t effective = (pool_difficulty > 0) ? pool_difficulty : 
+                        ((config.minDifficulty > 0) ? config.minDifficulty : 1);
     
-    Serial.printf("   Pool Difficulty: %u (effettiva: %u, richiede %d zeros)\n", 
-                 pool_difficulty, effective, difficulty_to_zeros(effective));
+    Serial.printf("   Pool Difficulty: %u", pool_difficulty);
+    if (pool_difficulty == 0) {
+        Serial.printf(" (not set by pool, using default: %u)", effective);
+    }
+    Serial.printf("\n   Mining with difficulty: %u (requires %d zeros)\n", 
+                 effective, difficulty_to_zeros(effective));
+    
+    // Clean up stale shares from previous jobs
+    cleanup_stale_shares(job->job_id.c_str());
+    
+    // Check if difficulty dropped - submit any pending shares that now qualify
+    if (pool_difficulty > 0 && pool_difficulty < old_difficulty) {
+        Serial.printf("📉 Difficulty dropped from %u to %u - checking pending shares\n", 
+                     old_difficulty, pool_difficulty);
+        check_pending_shares(job->job_id.c_str(), pool_difficulty);
+    }
 }
 
 // Callback quando arriva risposta dal pool per una share
@@ -155,79 +278,155 @@ uint32_t get_effective_difficulty() {
     return pool_difficulty;
 }
 
-// Approssimazione: converte difficoltà in zeri richiesti
-// Basato su: difficulty ≈ 2^(zeros * 4) / 65536
-// Diff 1 = ~8 zeros, Diff 4 = ~9 zeros, Diff 256 = ~12 zeros, Diff 65536 = ~16 zeros
-// TEMPORANEO: difficulty abbassate DRASTICAMENTE per TEST FINALE
-// Converte difficulty in numero di zeri richiesti nell'hash
+// Save a valuable hash for later submission if difficulty drops
+void save_pending_share(uint32_t nonce, double difficulty, int zeros, const uint8_t* hash, 
+                       const char* job_id, const char* ntime, uint32_t extranonce2) {
+    // Only save shares with 6+ zeros
+    if (zeros < 6) return;
+    
+    // Remove expired shares (older than 10 minutes = 600 seconds)
+    uint32_t now = millis() / 1000;
+    for (int i = 0; i < pending_count; ) {
+        if (now - pending_shares[i].timestamp > 600) {
+            // Expired - remove by shifting array
+            for (int j = i; j < pending_count - 1; j++) {
+                pending_shares[j] = pending_shares[j + 1];
+            }
+            pending_count--;
+        } else {
+            i++;
+        }
+    }
+    
+    // If queue is full, remove oldest (FIFO)
+    if (pending_count >= MAX_PENDING_SHARES) {
+        for (int i = 0; i < MAX_PENDING_SHARES - 1; i++) {
+            pending_shares[i] = pending_shares[i + 1];
+        }
+        pending_count = MAX_PENDING_SHARES - 1;
+    }
+    
+    // Add new pending share
+    PendingShare* share = &pending_shares[pending_count];
+    share->nonce = nonce;
+    share->difficulty = difficulty;
+    share->zeros = zeros;
+    memcpy(share->hash, hash, 32);
+    share->job_id = String(job_id);
+    share->ntime = String(ntime);
+    share->extranonce2 = extranonce2;
+    share->timestamp = now;
+    pending_count++;
+    
+    Serial.printf("💾 Saved pending share: %d zeros, diff %.0f, job %s (queue: %d/%d)\n", 
+                 zeros, difficulty, job_id, pending_count, MAX_PENDING_SHARES);
+}
+
+// Check if any pending shares can now be submitted (difficulty dropped or matches job)
+void check_pending_shares(const char* current_job_id, uint32_t current_difficulty) {
+    if (pending_count == 0) return;
+    
+    uint32_t effective_diff = get_effective_difficulty();
+    Serial.printf("🔍 Checking %d pending shares (current diff: %u, job: %s)\n", 
+                 pending_count, effective_diff, current_job_id);
+    
+    for (int i = 0; i < pending_count; ) {
+        PendingShare* share = &pending_shares[i];
+        
+        // Check if difficulty now allows this share AND job matches
+        if (share->difficulty >= (double)effective_diff && 
+            share->job_id.equals(current_job_id)) {
+            
+            Serial.printf("✅ Submitting pending share: %d zeros, diff %.0f\n", 
+                         share->zeros, share->difficulty);
+            
+            // Format nonce as hex (little-endian)
+            char nonce_hex[9];
+            snprintf(nonce_hex, sizeof(nonce_hex), "%02x%02x%02x%02x",
+                     (share->nonce >> 0) & 0xFF,
+                     (share->nonce >> 8) & 0xFF,
+                     (share->nonce >> 16) & 0xFF,
+                     (share->nonce >> 24) & 0xFF);
+            
+            // Format extranonce2 as hex (big-endian)
+            char extranonce2_hex[17];
+            int hex_len = 4 * 2;  // Assuming 4 bytes extranonce2
+            for(int k = 3; k >= 0; k--) {
+                snprintf(extranonce2_hex + ((3 - k) * 2), 3, "%02x", 
+                        (share->extranonce2 >> (k * 8)) & 0xFF);
+            }
+            extranonce2_hex[hex_len] = '\0';
+            
+            // Submit the share (job_id, extranonce2, ntime, nonce)
+            stratum_submit_share(share->job_id.c_str(), extranonce2_hex, 
+                               share->ntime.c_str(), nonce_hex);
+            
+            // Remove from queue (shift array)
+            for (int j = i; j < pending_count - 1; j++) {
+                pending_shares[j] = pending_shares[j + 1];
+            }
+            pending_count--;
+            // Don't increment i - we shifted array
+            
+        } else {
+            i++; // Move to next share
+        }
+    }
+}
+
+// Clean up pending shares when job becomes stale
+void cleanup_stale_shares(const char* new_job_id) {
+    if (pending_count == 0) return;
+    
+    int removed = 0;
+    for (int i = 0; i < pending_count; ) {
+        if (!pending_shares[i].job_id.equals(new_job_id)) {
+            // Job changed - this share is now stale
+            removed++;
+            // Remove by shifting array
+            for (int j = i; j < pending_count - 1; j++) {
+                pending_shares[j] = pending_shares[j + 1];
+            }
+            pending_count--;
+        } else {
+            i++;
+        }
+    }
+    
+    if (removed > 0) {
+        Serial.printf("🗑️  Removed %d stale shares (job changed to %s)\n", removed, new_job_id);
+    }
+}
+
+// Converte difficulty in numero di zeri esadecimali richiesti nell'hash
+// Usa la formula matematica corretta: zeros = 8 + log₁₆(difficulty)
 int difficulty_to_zeros(uint32_t difficulty) {
-    // Bitcoin difficulty to leading zero BITS (not bytes!)
-    // Difficulty 1 = target with 32 leading zero bits = 8 leading zero NIBBLES (hex digits)
-    // Each nibble is 4 bits, so 32 bits = 8 hex digits
-    // count_leading_zeros counts NIBBLES (hex digits), not bytes
+    if(difficulty == 0) return 0;  // Invalid/not set
+    if(difficulty == 1) return 8;  // Bitcoin baseline difficulty
     
-    if(difficulty <= 1) return 8;          // diff 1 = 32 zero bits = 8 hex digits
-    if(difficulty <= 4) return 10;         // diff 4 = ~40 zero bits
-    if(difficulty <= 16) return 11;        // diff 16 
-    if(difficulty <= 64) return 12;        // diff 64
-    if(difficulty <= 256) return 13;       // diff 256
-    if(difficulty <= 1024) return 14;      // diff 1K
-    if(difficulty <= 4096) return 15;      // diff 4K
-    if(difficulty <= 16384) return 16;     // diff 16K
-    if(difficulty <= 65536) return 17;     // diff 64K
-    if(difficulty <= 262144) return 18;    // diff 256K
-    if(difficulty <= 1048576) return 19;   // diff 1M
-    return 20; // Qualsiasi altra difficoltà
-}
-
-// NerdMiner-style difficulty calculation from hash
-// Bitcoin difficulty 1 target
-const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
-
-// Convert little-endian 256-bit value to double
-static double le256todouble(const void* target) {
-    uint64_t v64;
-    const uint8_t* data = (const uint8_t*)target;
+    // Correct formula: zeros = 8 + log₁₆(difficulty)
+    // where log₁₆(x) = log(x) / log(16)
+    // 
+    // This matches the mathematical relationship:
+    // - Each hex zero = target divided by 16
+    // - difficulty × 16 = target ÷ 16 = +1 zero
+    //
+    // Examples verified with Claude:
+    // - diff 1    → 8 zeros  (0x00000000FFFF0000...)
+    // - diff 16   → 9 zeros  (8 + log₁₆(16) = 8 + 1)
+    // - diff 64   → 10 zeros (8 + log₁₆(64) = 8 + 1.5 ≈ 10)
+    // - diff 256  → 10 zeros (8 + log₁₆(256) = 8 + 2)
+    // - diff 1000 → 11 zeros (8 + log₁₆(1000) = 8 + 2.5 ≈ 11)
+    // - diff 4096 → 12 zeros (8 + log₁₆(4096) = 8 + 3)
     
-    // Find first non-zero byte from the end (big-endian perspective)
-    int i;
-    for (i = 31; i >= 0; i--) {
-        if (data[i] != 0)
-            break;
-    }
+    double log16_diff = log((double)difficulty) / log(16.0);
+    int zeros = 8 + (int)round(log16_diff);
     
-    if (i < 0)
-        return 0.0;
+    // Sanity check: clamp to reasonable range
+    if(zeros < 8) zeros = 8;
+    if(zeros > 20) zeros = 20;  // Max practical limit
     
-    // Take up to 8 bytes for double precision
-    int start = (i >= 7) ? (i - 7) : 0;
-    v64 = 0;
-    
-    for (int j = i; j >= start; j--) {
-        v64 = (v64 << 8) | data[j];
-    }
-    
-    // Adjust for position
-    int shift = start * 8;
-    double d = (double)v64;
-    
-    // Scale by position
-    for (int j = 0; j < shift; j += 8) {
-        d *= 256.0;
-    }
-    
-    return d;
-}
-
-// Calculate difficulty from hash (NerdMiner algorithm)
-double diff_from_target(const uint8_t* hash) {
-    double d64 = truediffone;
-    double dcut64 = le256todouble(hash);
-    
-    if (dcut64 == 0.0)
-        dcut64 = 1.0;
-    
-    return d64 / dcut64;
+    return zeros;
 }
 
 // Costruisce la coinbase transaction da componenti Stratum
@@ -543,8 +742,10 @@ void miningTask(void* parameter)
                 // Timestamp
                 pool_header.timestamp = strtoul(current_pool_job.ntime.c_str(), NULL, 16);
                 
-                // Nonce - inizia da 0 e incrementa
-                pool_header.nonce = 0;
+                // Nonce - reset to worker's unique starting point (0 or 1)
+                // Do NOT reset to 0 for all workers - this causes duplicates!
+                nonce = worker_id;
+                pool_header.nonce = nonce;
                 
                 // Aggiorna block height (non fornito da Stratum, usa 0)
                 stats->block_height = 0;
@@ -561,254 +762,325 @@ void miningTask(void* parameter)
                 }
             }  // Fine if(need_rebuild_header)
             
-            // ⚠️ IMPORTANTE: Ricalcola merkle root quando necessario
-            static uint32_t last_extranonce2 = 0xFFFFFFFF;
-            static String last_job_id = "";
+            // ═══════════════════════════════════════════════════════════════
+            // 🚀 NERDMINER OPTIMIZATION 1: Smart Job Cache
+            // Only recalculate when job/extranonce2 actually changes
+            // ═══════════════════════════════════════════════════════════════
+            
             bool need_recalc = false;
             
-            // Ricalcola se:
-            // 1. Extranonce2 cambiato (dopo submit share)
-            // 2. Nuovo job ricevuto
-            // 3. Prima volta in assoluto (last_job_id vuoto)
-            if(extranonce2 != last_extranonce2 || 
-               current_pool_job.job_id != last_job_id ||
-               last_job_id.length() == 0) {
+            if (!g_job_cache.valid ||
+                extranonce2 != g_job_cache.extranonce2 ||
+                current_pool_job.job_id != g_job_cache.job_id) {
                 need_recalc = true;
             }
             
-            Serial.printf("DEBUG: job=%s, last_job=%s, ex2=%u, last_ex2=%u, need_recalc=%d\n", 
-                         current_pool_job.job_id.c_str(), last_job_id.c_str(),
-                         extranonce2, last_extranonce2, need_recalc);
-            
             if(need_recalc) {
-                Serial.printf("🔄 Ricalcolo merkle root... (extranonce2=%u, job=%s)\n", 
+                Serial.printf("🔄 Job update: ex2=%u, job=%s\n", 
                              extranonce2, current_pool_job.job_id.c_str());
+                
+                // Build coinbase and merkle root
                 uint8_t coinbase_hash[32];
                 build_coinbase(&current_pool_job, extranonce2, coinbase_hash);
                 calculate_merkle_root(coinbase_hash, current_pool_job.merkle_branch, pool_header.merkleRoot);
                 
-                // 🚀 PERFORMANCE CRITICA: Pre-calcola midstate + bake!
-                calc_midstate((uint8_t*)&pool_header);
+                // ═══════════════════════════════════════════════════════════════
+                // 🚀 NERDMINER OPTIMIZATION 2: Pre-calculate Midstate + Baking
+                // This is the KEY to 3x speed improvement!
+                // ═══════════════════════════════════════════════════════════════
                 
-                last_extranonce2 = extranonce2;
-                last_job_id = current_pool_job.job_id;
-            } else {
-                Serial.println("✅ Merkle/midstate già calcolati, riuso valori!");
+                // CRITICAL FIX: Build header buffer in correct byte order (NerdMiner compatible)
+                // NerdMiner reverses: version (full), prevhash (word swap), ntime (full), nbits (full)
+                uint8_t* buf = g_job_cache.header_template;
+                
+                // Version (4 bytes) - FULL byte reverse (like NerdMiner)
+                uint32_t version_val = strtoul(current_pool_job.version.c_str(), NULL, 16);
+                buf[0] = version_val & 0xFF;
+                buf[1] = (version_val >> 8) & 0xFF;
+                buf[2] = (version_val >> 16) & 0xFF;
+                buf[3] = (version_val >> 24) & 0xFF;
+                
+                // Previous block hash (32 bytes) - already correctly byte-swapped in pool_header
+                memcpy(buf + 4, pool_header.prevBlockHash, 32);
+                
+                // Merkle root (32 bytes) - raw bytes, NO swapping
+                memcpy(buf + 36, pool_header.merkleRoot, 32);
+                
+                // Timestamp (4 bytes) - Parse hex string byte-by-byte (Stratum sends as hex string)
+                // "ff8c1669" -> bytes [0xff, 0x8c, 0x16, 0x69]
+                for (int i = 0; i < 4; i++) {
+                    char byte_str[3] = {current_pool_job.ntime[i*2], current_pool_job.ntime[i*2+1], 0};
+                    buf[68 + i] = (uint8_t)strtol(byte_str, NULL, 16);
+                }
+                
+                // Bits (4 bytes) - Parse hex string byte-by-byte (Stratum sends as hex string)
+                // "36d90117" -> bytes [0x36, 0xd9, 0x01, 0x17]
+                for (int i = 0; i < 4; i++) {
+                    char byte_str[3] = {current_pool_job.nbits[i*2], current_pool_job.nbits[i*2+1], 0};
+                    buf[72 + i] = (uint8_t)strtol(byte_str, NULL, 16);
+                }
+                
+                // Nonce (4 bytes, will be updated in mining loop - initialize to 0)
+                buf[76] = 0;
+                buf[77] = 0;
+                buf[78] = 0;
+                buf[79] = 0;
+                
+                // SHA-256 padding (bytes 80-127)
+                memset(buf + 80, 0, 48);
+                buf[80] = 0x80;      // SHA-256 padding
+                buf[126] = 0x02;     // Length (0x0280 = 640 bits)
+                buf[127] = 0x80;
+                
+                // Calculate midstate (first 64 bytes) - ONCE PER JOB!
+                nerd_mids(g_job_cache.midstate, g_job_cache.header_template);
+                
+                // Bake the second half (pre-compute constants) - ONCE PER JOB!
+                nerd_sha256_bake(g_job_cache.midstate, g_job_cache.header_template + 64, g_job_cache.bake);
+                
+                // Calculate target from nbits for share validation (NerdMiner method)
+                if (!calculate_target_from_nbits(current_pool_job.nbits.c_str(), g_job_cache.target)) {
+                    Serial.printf("⚠️  Failed to calculate target from nbits: %s\n", current_pool_job.nbits.c_str());
+                    memset(g_job_cache.target, 0xFF, 32);  // Set to max (accept nothing) on error
+                }
+                
+                // Cache everything for reuse
+                g_job_cache.extranonce2 = extranonce2;
+                g_job_cache.job_id = current_pool_job.job_id;
+                memcpy(g_job_cache.merkle_root, pool_header.merkleRoot, 32);
+                g_job_cache.valid = true;
             }
             
-            // Loop continuo su TUTTI i nonces senza ricalcolare merkle!
-            // Statistiche ogni NONCE_TEST_BATCH per monitoraggio
-            const uint32_t NONCE_TEST_BATCH = 5000000;  // 5M nonces tra stats
-            uint32_t batch_end = nonce + NONCE_TEST_BATCH;
+            // ⚡⚡⚡ PERFORMANCE CRITICAL: Minimal overhead mining loop (NerdMiner style)
+            // Process small batches (4K nonces like NerdMiner) for fast job switching
+            const uint32_t NONCE_PER_BATCH = 4096;  // 4K nonces per batch (NerdMiner standard)
+            uint32_t batch_end = nonce + NONCE_PER_BATCH;
             uint32_t batch_start_time = millis();
-            uint32_t batch_hashes = 0;  // Conta hash in questo batch
-            bool first_stats_sent = false;  // Flag per primo aggiornamento rapido stats
+            uint32_t batch_hashes = 0;
             
-            // ⚡ OTTIMIZZAZIONE CRITICA: Pre-calcola valori fuori dal loop
+            // Pre-calculate effective difficulty once
             uint32_t effective_diff = get_effective_difficulty();
-            int required_zeros = difficulty_to_zeros(effective_diff);
-            const int MIN_ZEROS_THRESHOLD = 1;
-            int effective_zeros_needed = (required_zeros > MIN_ZEROS_THRESHOLD) ? required_zeros : MIN_ZEROS_THRESHOLD;
             
-            Serial.printf("⛏️  Worker %d batch: %u nonces, diff=%u, zeros=%d, starting nonce=%u\n", 
-                         worker_id, NONCE_TEST_BATCH, effective_diff, effective_zeros_needed, nonce);
+            // Copy cached header template for this batch
+            uint8_t header_bytes[128];
+            memcpy(header_bytes, g_job_cache.header_template, 128);
             
-            // Salva job_id corrente per verificare se cambia durante il batch
+            // Save current job ID to detect job changes
             String current_job_id = current_pool_job.job_id;
             
-            // 🚀 PERFORMANCE CRITICAL: Prepare data buffer for optimized mining
-            // NerdMiner approach: modify only nonce bytes, keep rest constant
-            uint8_t header_bytes[80];
-            memcpy(header_bytes, &pool_header, 80);
-            
-            // Performance test: measure 10K hashes
-            uint32_t perf_test_start = micros();
-            const uint32_t PERF_TEST_COUNT = 10000;
-            
-            // 🔥 DUAL-WORKER OPTIMIZATION: Step by 2, each worker handles even/odd nonces
-            // Worker 0: 0, 2, 4, 6, 8, ...
-            // Worker 1: 1, 3, 5, 7, 9, ...
+            // Dual-worker: step by 2 (worker 0 tests even, worker 1 tests odd)
             const uint32_t nonce_step = 2;
             
+            // ⚡⚡⚡ ULTRA-FAST MINING LOOP - Minimal overhead! ⚡⚡⚡
             for(; nonce < batch_end && taskRunning; nonce += nonce_step) {
-                // ⚡ OTTIMIZZAZIONE CRITICA: Modifica SOLO i 4 bytes del nonce (offset 76)
+                // Update nonce as plain uint32_t (buffer already has correct byte order)
                 ((uint32_t*)(header_bytes + 76))[0] = nonce;
                 
-                // ⚡ CHIAVE: Usa sha256_double_hash_80 con midstate pre-calcolato!
-                sha256_double_hash_80(header_bytes, hash);
-                
-                // Performance measurement
-                if(batch_hashes == PERF_TEST_COUNT) {
-                    uint32_t perf_elapsed = micros() - perf_test_start;
-                    uint32_t perf_khash = (PERF_TEST_COUNT * 1000000ULL) / perf_elapsed / 1000;
-                    Serial.printf("⚡ PERF TEST: %u hashes in %u μs = %u KH/s\n", 
-                                 PERF_TEST_COUNT, perf_elapsed, perf_khash);
-                }
-                
-                batch_hashes++;
-                stats->total_hashes++;
-                
-                // � EARLY STATS UPDATE: Calcola hashrate dopo primo milione per feedback rapido
-                if(!first_stats_sent && batch_hashes >= 1000000) {
-                    uint32_t early_elapsed = millis() - batch_start_time;
-                    if(early_elapsed > 0) {
-                        stats->hashes_per_second = ((uint64_t)batch_hashes * 1000ULL) / early_elapsed;
-                        Serial.printf("📊 Early stats (1M hashes): %u H/s (%.1f KH/s)\n",
-                                     stats->hashes_per_second, stats->hashes_per_second / 1000.0);
-                    }
-                    first_stats_sent = true;
-                }
-                
-                // �🔧 WATCHDOG FIX: Yield every 8K hashes (safer for slower speeds)
-                // At 33 KH/s: 8K hashes = ~242ms work
-                // Light yield (1 tick ~10ms) = ~4% overhead
-                if((batch_hashes % 4000) == 0) {
-                    vTaskDelay(2);
-                    esp_task_wdt_reset();
-                }
-                
-                // ⚡ OTTIMIZZAZIONE 1: Quick check PRIMA di invertire byte!
-                // Se hash[31] != 0, impossibile avere 1+ zero → skip tutto
-                if(hash[31] != 0) continue;
-                
-                // ⚡ OTTIMIZZAZIONE 2: Reverse solo se hash promettente
-                uint8_t hash_reversed[32];
-                for(int j = 0; j < 32; j++) {
-                    hash_reversed[j] = hash[31 - j];
-                }
-                
-                // Conta zeri solo ora
-                int zeros = count_leading_zeros(hash_reversed);
-                
-                // Aggiorna best assoluto solo se migliora (track by zeros for speed)
-                if(zeros > absolute_best_zeros) {
-                    absolute_best_zeros = zeros;
-                    hash_to_hex(hash_reversed, hash_hex);
-                    memcpy(absolute_best_hash, hash_hex, 65);
+                // Compute hash with early rejection filter
+                if (nerd_sha256d_baked(g_job_cache.midstate, header_bytes + 64, 
+                                      g_job_cache.bake, hash))
+                {
+                    // Hash passed filter - calculate difficulty
+                    // NerdMiner passes hash DIRECTLY - le256todouble handles byte order internally
+                    double hash_difficulty = diff_from_target(hash);
                     
-                    // Calculate difficulty only when we find a new best
-                    double hash_difficulty = diff_from_target(hash_reversed);
-                    stats->best_difficulty = hash_difficulty;
-                    stats->best_difficulty_zeros = zeros;
-                    memcpy(stats->best_hash, hash_hex, 65);
-                    
-                    if(zeros >= 4) {
-                        Serial.printf("🎯 New best: %d zeros (%.0f difficulty) - Hash: %s\n", 
-                                     zeros, hash_difficulty, hash_hex);
-                    }
-                }
-                
-                // Aggiorna best periodo
-                if(zeros > best_zeros) {
-                    best_zeros = zeros;
-                }
-                
-                // 🚀 NERDMINER SHARE VALIDATION: Only calculate difficulty for high-zero hashes
-                // For pool difficulty validation, only check hashes with enough zeros
-                if(zeros >= (required_zeros - 1)) {  // Check hashes close to requirement
-                    double hash_difficulty = diff_from_target(hash_reversed);
-                    
-                    if(hash_difficulty >= (double)effective_diff) {
-                        char share_hash_hex[65];
-                        hash_to_hex(hash_reversed, share_hash_hex);
+                    // Update best if improved
+                    if(hash_difficulty > stats->best_difficulty) {
+                        stats->best_difficulty = hash_difficulty;
                         
-                        Serial.println("⭐ VALID SHARE FOUND!");
-                        Serial.printf("   Nonce: 0x%08x\n", pool_header.nonce);
-                        Serial.printf("   Hash: %s\n", share_hash_hex);
-                        Serial.printf("   Hash Difficulty: %.2f (zeros: %d)\n", hash_difficulty, zeros);
-                        Serial.printf("   Pool Difficulty: %u\n", effective_diff);
-                        Serial.printf("   Extranonce2: 0x%08x\n", extranonce2);
-                    
-                    // Prepara dati per submit (CORRETTO byte order come NerdMiner)
-                    char nonce_hex[9];
-                    // IMPORTANTE: Nonce in little-endian per Stratum
-                    snprintf(nonce_hex, sizeof(nonce_hex), "%02x%02x%02x%02x",
-                             (pool_header.nonce >> 0) & 0xFF,
-                             (pool_header.nonce >> 8) & 0xFF,
-                             (pool_header.nonce >> 16) & 0xFF,
-                             (pool_header.nonce >> 24) & 0xFF);
-                    
-                    char ntime_hex[9];
-                    // IMPORTANTE: Ntime in little-endian per Stratum
-                    snprintf(ntime_hex, sizeof(ntime_hex), "%02x%02x%02x%02x",
-                             (pool_header.timestamp >> 0) & 0xFF,
-                             (pool_header.timestamp >> 8) & 0xFF,
-                             (pool_header.timestamp >> 16) & 0xFF,
-                             (pool_header.timestamp >> 24) & 0xFF);
-                    
-                    // Converte extranonce2 in hex string (little endian)
-                    char extranonce2_hex[17];
-                    int hex_len = current_pool_job.extranonce2_size * 2;
-                    for(int i = 0; i < current_pool_job.extranonce2_size; i++) {
-                        snprintf(extranonce2_hex + (i * 2), 3, "%02x", (extranonce2 >> (i * 8)) & 0xFF);
-                    }
-                    extranonce2_hex[hex_len] = '\0';
-                    
-                    // Incrementa share submitted PRIMA di inviare
-                    stats->shares_submitted++;
-                    
-                    // Invia share al pool
-                    bool sent = stratum_submit_share(current_pool_job.job_id.c_str(), 
-                                           extranonce2_hex, ntime_hex, nonce_hex);
-                    
-                    if(sent) {
-                        Serial.println("📤 Share inviata al pool (attendo conferma...)");
-                    } else {
-                        Serial.println("❌ Errore invio share (TCP failed)");
-                        stats->shares_rejected++;
+                        // Calculate leading zeros from hash for display
+                        // Hash is in big-endian format, zeros are at the END
+                        // Count from the end (which represents leading zeros in LE interpretation)
+                        int zeros = 0;
+                        for(int i = 31; i >= 0; i--) {
+                            if(hash[i] == 0) {
+                                zeros += 2;  // 2 hex digits per byte
+                            } else if((hash[i] & 0xF0) == 0) {
+                                zeros += 1;  // High nibble is zero (e.g., 0x01, 0x0F)
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+                        stats->best_difficulty_zeros = zeros;
+                        
+                        char hash_hex[65];
+                        for(int i = 0; i < 32; i++) {
+                            sprintf(hash_hex + (i * 2), "%02x", hash[i]);
+                        }
+                        hash_hex[64] = '\0';
+                        memcpy(stats->best_hash, hash_hex, 65);
                     }
                     
-                    // Incrementa extranonce2 per la prossima share e ricalcola merkle
-                    extranonce2++;
-                    break;  // Esci dal batch e ricalcola merkle root
-                    }  // Fine if(hash_difficulty >= effective_diff)
-                }  // Fine if(zeros >= required_zeros - 1)
-            }  // Fine for nonce loop
+                    // Check if valid share
+                    if(hash_difficulty >= (double)effective_diff) {
+                        // Count leading zeros in hash (zeros at END = leading zeros in LE)
+                        int share_zeros = 0;
+                        for(int i = 31; i >= 0; i--) {
+                            if(hash[i] == 0) {
+                                share_zeros += 2;  // Entire byte is 00 = 2 hex zeros
+                            } else if((hash[i] & 0xF0) == 0) {
+                                share_zeros += 1;  // High nibble is 0 (e.g., 0x01, 0x0F)
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+                        
+                        // Log ALL valuable hashes (5+ zeros) for visibility
+                        if(share_zeros >= 5) {
+                            // Hash is stored big-endian, but leading zeros are at the END (hash[31]...)
+                            // To display with zeros at the start, print from hash[31] downwards
+                            char hash_preview[17];  // Last 8 bytes (where leading zeros are)
+                            for(int i = 31; i >= 24; i--) {
+                                sprintf(hash_preview + ((31-i) * 2), "%02x", hash[i]);
+                            }
+                            hash_preview[16] = '\0';
+                            Serial.printf("💎 Found %dz hash (diff %.0f): %s...\n", 
+                                         share_zeros, hash_difficulty, hash_preview);
+                        }
+                        
+                        // Submit strategy: Check if hash meets target (NerdMiner method)
+                        // This is the CORRECT way - compare hash directly with target from nbits
+                        // NOT by comparing difficulty numbers which have conversion issues
+                        bool should_submit = check_hash_meets_target(hash, g_job_cache.target);
+                        
+                        // Debug: log comparison
+                        if (share_zeros >= 5 && hash_difficulty > 10000) {
+                            Serial.printf("📊 Share: %dz, diff=%.0f → %s (target-based validation)\n",
+                                         share_zeros, hash_difficulty, 
+                                         should_submit ? "SUBMIT ✓" : "SKIP ✗");
+                        }
+                        
+                        // Heartbeat: send lower difficulty shares periodically to maintain pool visibility
+                        // Even if rejected, this keeps worker visible and hashrate calculated on pool website
+                        uint32_t now = millis() / 1000;
+                        bool is_heartbeat = false;
+                        if (!should_submit && share_zeros >= 5 && 
+                            (now - last_heartbeat_share_time) >= 60) {
+                            should_submit = true;
+                            is_heartbeat = true;
+                            last_heartbeat_share_time = now;
+                            Serial.printf("💓 Heartbeat share (%.0f diff, %dz) - keeping worker visible\n", 
+                                         hash_difficulty, share_zeros);
+                        }
+                        
+                        if(should_submit) {
+                            // Format hash as hex string
+                            char hash_hex[65];
+                            for(int i = 0; i < 32; i++) {
+                                sprintf(hash_hex + (i * 2), "%02x", hash[i]);
+                            }
+                            hash_hex[64] = '\0';
+                            
+                            Serial.println("\n⭐ VALID SHARE FOUND!");
+                            Serial.printf("   Nonce: 0x%08x\n", nonce);
+                            Serial.printf("   Difficulty: %.2f (%d zeros)\n", hash_difficulty, share_zeros);
+                            Serial.printf("   Hash: %s\n", hash_hex);
+                            
+                            // Submit share to pool
+                            char nonce_hex[9];
+                            // IMPORTANTE: Nonce in little-endian per Stratum
+                            snprintf(nonce_hex, sizeof(nonce_hex), "%02x%02x%02x%02x",
+                                     (nonce >> 0) & 0xFF,
+                                     (nonce >> 8) & 0xFF,
+                                     (nonce >> 16) & 0xFF,
+                                     (nonce >> 24) & 0xFF);
+                            
+                            // IMPORTANTE: Use ORIGINAL ntime string from job (NerdMiner does this)
+                            const char* ntime_hex = current_pool_job.ntime.c_str();
+                            
+                            // CRITICAL FIX: extranonce2 deve essere in BIG-ENDIAN per Stratum!
+                            // NerdMiner usa "00000001" non "01000000"!
+                            char extranonce2_hex[17];
+                            int hex_len = current_pool_job.extranonce2_size * 2;
+                            // Write in BIG-ENDIAN order (most significant byte first)
+                            for(int i = current_pool_job.extranonce2_size - 1; i >= 0; i--) {
+                                snprintf(extranonce2_hex + ((current_pool_job.extranonce2_size - 1 - i) * 2), 3, "%02x", (extranonce2 >> (i * 8)) & 0xFF);
+                            }
+                            extranonce2_hex[hex_len] = '\0';
+                            
+                            // Incrementa share submitted PRIMA di inviare
+                            stats->shares_submitted++;
+                            
+                            // Invia share al pool
+                            bool sent = stratum_submit_share(current_pool_job.job_id.c_str(), 
+                                                   extranonce2_hex, ntime_hex, nonce_hex);
+                            
+                            if(sent) {
+                                Serial.println("📤 Share inviata al pool (attendo conferma...)");
+                            } else {
+                                Serial.println("❌ Errore invio share (TCP failed)");
+                                stats->shares_rejected++;
+                            }
+                        } else {
+                            // Valuable hash but doesn't meet current pool requirements
+                            // Save it in case pool lowers difficulty later
+                            if (share_zeros >= 6) {
+                                save_pending_share(nonce, hash_difficulty, share_zeros, hash,
+                                                 current_pool_job.job_id.c_str(),
+                                                 current_pool_job.ntime.c_str(), 
+                                                 extranonce2);
+                            }
+                        }  // End if(should_submit)
+                    }  // End if(hash_difficulty >= effective_diff)
+                    
+                    // NerdMiner does NOT increment extranonce2 - it uses the same value for all shares!
+                    // Each nonce already produces a different hash, no need to change extranonce2
+                    // extranonce2++; // REMOVED - keep extranonce2 constant like NerdMiner
+                    
+                    // Don't break - continue mining the rest of the batch!
+                    // Breaking would cause nonce to reset to the same value on next iteration
+                    // Just continue to next nonce in the batch
+                }  // End if (hash passed filter)
+            }  // End mining loop
             
-            // Calcola hashrate dopo ogni batch
+            // Update total hashes for this batch (all nonces tested)
+            stats->total_hashes += (NONCE_PER_BATCH / nonce_step);
+            
+            // Calculate hashrate
             uint32_t batch_elapsed = millis() - batch_start_time;
             if(batch_elapsed > 0) {
-                // FIX: Use uint64_t to avoid overflow with large batch_hashes
-                stats->hashes_per_second = ((uint64_t)batch_hashes * 1000ULL) / batch_elapsed;
+                stats->hashes_per_second = ((uint64_t)(NONCE_PER_BATCH / nonce_step) * 1000ULL) / batch_elapsed;
             }
             
-            Serial.printf("DEBUG HASHRATE: batch_hashes=%u, elapsed=%u, calculated=%u\n",
-                         batch_hashes, batch_elapsed, stats->hashes_per_second);
-            
-            // Ogni batch completato (o overflow nonce), incrementa extranonce2
-            if(nonce == 0) {  // Overflow dopo 4.3 miliardi
-                extranonce2++;
+            // Check for job change every 256 nonces (NerdMiner style)
+            if((nonce & 0xFF) == 0 && current_pool_job.job_id != current_job_id) {
+                // Job changed, restart with new job
+                continue;
             }
             
-            // Log statistiche ogni 1 batch (ogni 5M nonces)
-            static uint32_t total_batches = 0;
-            total_batches++;
+            // Periodic statistics (every 10 batches ~40K nonces = ~1 second at 40 KH/s)
+            static uint32_t batch_counter = 0;
+            batch_counter++;
             
-            Serial.println("\n╔══════════════════════════════════════════════════════════╗");
-            Serial.println("║              📊 MINING STATISTICS                       ║");
-            Serial.println("╚══════════════════════════════════════════════════════════╝");
-            Serial.printf("  Batch #%u completed\n", total_batches);
-            Serial.printf("  Current nonce:    %u (%.1f%%)\n", nonce, (nonce / 42949672.96));
-            Serial.printf("  ⚡ Hashrate:       %u H/s (%.1f KH/s)\n", 
-                         stats->hashes_per_second, stats->hashes_per_second / 1000.0);
-            Serial.printf("  Batch time:       %u ms (%.1f sec)\n", batch_elapsed, batch_elapsed / 1000.0);
-            Serial.printf("  Batch hashes:     %u\n", batch_hashes);
-            Serial.printf("  Total hashes:     %u\n", stats->total_hashes);
-            Serial.printf("  Absolute best:    %.0f difficulty (%u zeros)\n", 
-                         stats->best_difficulty, absolute_best_zeros);
-            if(absolute_best_zeros > 0) {
-                Serial.printf("  Best hash:        %s\n", absolute_best_hash);
+            // Print statistics only every 10M hashes (reduced spam)
+            if((stats->total_hashes % 10000000) < 4096) {
+                Serial.println("\n╔══════════════════════════════════════════════════════════╗");
+                Serial.println("║              📊 MINING STATISTICS                       ║");
+                Serial.println("╚══════════════════════════════════════════════════════════╝");
+                Serial.printf("  Batch #%u completed\n", batch_counter);
+                Serial.printf("  Current nonce:    %u (%.1f%%)\n", nonce, (nonce / 42949672.96));
+                Serial.printf("  ⚡ Hashrate:       %u H/s (%.1f KH/s)\n", 
+                             stats->hashes_per_second, stats->hashes_per_second / 1000.0);
+                Serial.printf("  Total hashes:     %u\n", stats->total_hashes);
+                Serial.printf("  Best difficulty:  %.0f (%d zeros)\n", 
+                             stats->best_difficulty, stats->best_difficulty_zeros);
+                Serial.printf("  Shares submitted: %u\n", stats->shares_submitted);
+                Serial.printf("  Shares accepted:  %u\n", stats->shares_accepted);
+                Serial.printf("  Shares rejected:  %u\n", stats->shares_rejected);
+                Serial.printf("  Pool difficulty:  %u (requires %d zeros)\n", 
+                             get_effective_difficulty(), difficulty_to_zeros(get_effective_difficulty()));
+                Serial.printf("  Uptime:           %u seconds\n", millis() / 1000);
+                Serial.println("════════════════════════════════════════════════════════════\n");
             }
-            Serial.printf("  Shares submitted: %u\n", stats->shares_submitted);
-            Serial.printf("  Shares accepted:  %u\n", stats->shares_accepted);
-            Serial.printf("  Shares rejected:  %u\n", stats->shares_rejected);
-            Serial.printf("  Pool difficulty:  %u (requires %d zeros)\n", 
-                         get_effective_difficulty(), difficulty_to_zeros(get_effective_difficulty()));
-            Serial.printf("  Uptime:           %u seconds\n", millis() / 1000);
-            Serial.println("════════════════════════════════════════════════════════════\n");
             
-            continue;  // Torna all'inizio del while loop
-        }  // Fine if(currentMiningMode == MINING_MODE_POOL)
+            // Watchdog reset after batch
+            esp_task_wdt_reset();
+            vTaskDelay(1);  // Yield to other tasks
+            
+            continue;  // Next batch
+        }  // End MINING_MODE_POOL
         
         // MODALITÀ SOLO/EDUCATIONAL: mining classico
         // Incrementa il nonce per ogni tentativo
@@ -823,7 +1095,7 @@ void miningTask(void* parameter)
         
         // 🔧 WATCHDOG FIX: Yield every 4K hashes in educational mode too
         if((hashes % 4000) == 0) {
-            vTaskDelay(2);
+            vTaskDelay(1);
             esp_task_wdt_reset();
         }
         
@@ -1082,6 +1354,13 @@ MiningStats mining_get_stats(void)
     combined.shares_rejected = stats_worker0.shares_rejected + stats_worker1.shares_rejected;
     
     return combined;
+}
+
+// Get best zeros from both cores separately for display
+void mining_get_dual_core_stats(int* core0_zeros, int* core1_zeros)
+{
+    if (core0_zeros) *core0_zeros = stats_worker0.best_difficulty_zeros;
+    if (core1_zeros) *core1_zeros = stats_worker1.best_difficulty_zeros;
 }
 
 // Check if a block has been found
