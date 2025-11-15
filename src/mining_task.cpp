@@ -54,19 +54,15 @@ static bool calculate_target_from_nbits(const char* nbits_hex, uint8_t* target_o
 }
 
 // Check if hash meets target (NerdMiner method)
-// Both hash and target should be in little-endian format
+// Hash from nerd_sha256d_baked is in BIG-ENDIAN (PUT_UINT32_BE)
+// Target from nbits is in BIG-ENDIAN
+// Compare directly byte-by-byte from MSB to LSB
 static bool check_hash_meets_target(const uint8_t* hash, const uint8_t* target) {
-    // Compare bytes from most significant to least significant
-    // Hash is already in little-endian, target needs reversal for comparison
-    uint8_t target_le[32];
-    memcpy(target_le, target, 32);
-    reverse_bytes(target_le, 32);
-    
-    // Compare byte by byte (big-endian order, so start from end of little-endian array)
-    for (int i = 31; i >= 0; i--) {
-        if (hash[i] > target_le[i]) {
+    // Compare from byte 0 (MSB) to byte 31 (LSB) for big-endian
+    for (int i = 0; i < 32; i++) {
+        if (hash[i] > target[i]) {
             return false;  // Hash too large
-        } else if (hash[i] < target_le[i]) {
+        } else if (hash[i] < target[i]) {
             return true;   // Hash smaller than target
         }
         // If equal, continue to next byte
@@ -340,13 +336,9 @@ void check_pending_shares(const char* current_job_id, uint32_t current_difficult
             Serial.printf("✅ Submitting pending share: %d zeros, diff %.0f\n", 
                          share->zeros, share->difficulty);
             
-            // Format nonce as hex (little-endian)
+            // Format nonce as hex (BIG-ENDIAN like NerdMiner)
             char nonce_hex[9];
-            snprintf(nonce_hex, sizeof(nonce_hex), "%02x%02x%02x%02x",
-                     (share->nonce >> 0) & 0xFF,
-                     (share->nonce >> 8) & 0xFF,
-                     (share->nonce >> 16) & 0xFF,
-                     (share->nonce >> 24) & 0xFF);
+            snprintf(nonce_hex, sizeof(nonce_hex), "%08x", share->nonce);
             
             // Format extranonce2 as hex (big-endian)
             char extranonce2_hex[17];
@@ -929,15 +921,15 @@ void miningTask(void* parameter)
                         
                         // Log ALL valuable hashes (5+ zeros) for visibility
                         if(share_zeros >= 5) {
-                            // Hash is stored big-endian, but leading zeros are at the END (hash[31]...)
-                            // To display with zeros at the start, print from hash[31] downwards
-                            char hash_preview[17];  // Last 8 bytes (where leading zeros are)
-                            for(int i = 31; i >= 24; i--) {
-                                sprintf(hash_preview + ((31-i) * 2), "%02x", hash[i]);
+                            // Format hash in little-endian (zeros at start) for display
+                            // Hash is stored big-endian in memory, so print from byte 31 to 0
+                            char hash_le[65];
+                            for(int i = 31; i >= 0; i--) {
+                                sprintf(hash_le + ((31-i) * 2), "%02x", hash[i]);
                             }
-                            hash_preview[16] = '\0';
-                            Serial.printf("💎 Found %dz hash (diff %.0f): %s...\n", 
-                                         share_zeros, hash_difficulty, hash_preview);
+                            hash_le[64] = '\0';
+                            Serial.printf("💎 Found %dz hash (diff %.0f): %s\n", 
+                                         share_zeros, hash_difficulty, hash_le);
                         }
                         
                         // Submit strategy: Check if hash meets target (NerdMiner method)
@@ -966,26 +958,23 @@ void miningTask(void* parameter)
                         }
                         
                         if(should_submit) {
-                            // Format hash as hex string
-                            char hash_hex[65];
-                            for(int i = 0; i < 32; i++) {
-                                sprintf(hash_hex + (i * 2), "%02x", hash[i]);
+                            // Format hash in little-endian (zeros at start) - same as "Found xz hash"
+                            // Hash is stored big-endian in memory, so print from byte 31 to 0
+                            char hash_le[65];
+                            for(int i = 31; i >= 0; i--) {
+                                sprintf(hash_le + ((31-i) * 2), "%02x", hash[i]);
                             }
-                            hash_hex[64] = '\0';
+                            hash_le[64] = '\0';
                             
                             Serial.println("\n⭐ VALID SHARE FOUND!");
                             Serial.printf("   Nonce: 0x%08x\n", nonce);
                             Serial.printf("   Difficulty: %.2f (%d zeros)\n", hash_difficulty, share_zeros);
-                            Serial.printf("   Hash: %s\n", hash_hex);
+                            Serial.printf("   Hash (LE): %s\n", hash_le);
                             
                             // Submit share to pool
+                            // CRITICAL: Nonce must be in BIG-ENDIAN format (like NerdMiner String(nonce, HEX))
                             char nonce_hex[9];
-                            // IMPORTANTE: Nonce in little-endian per Stratum
-                            snprintf(nonce_hex, sizeof(nonce_hex), "%02x%02x%02x%02x",
-                                     (nonce >> 0) & 0xFF,
-                                     (nonce >> 8) & 0xFF,
-                                     (nonce >> 16) & 0xFF,
-                                     (nonce >> 24) & 0xFF);
+                            snprintf(nonce_hex, sizeof(nonce_hex), "%08x", nonce);
                             
                             // IMPORTANTE: Use ORIGINAL ntime string from job (NerdMiner does this)
                             const char* ntime_hex = current_pool_job.ntime.c_str();
