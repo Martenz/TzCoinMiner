@@ -263,9 +263,9 @@ uint32_t get_effective_difficulty() {
     extern WifiConfig config;
     
     // Se pool_difficulty è 0 (pool non ha ancora inviato difficulty)
-    // usa minDifficulty configurato come fallback (o default 1)
+    // usa minDifficulty configurato come fallback (o default 32)
     if (pool_difficulty == 0) {
-        uint32_t fallback = (config.minDifficulty > 0) ? config.minDifficulty : 1;
+        uint32_t fallback = (config.minDifficulty > 0) ? config.minDifficulty : 32;
         return fallback;
     }
     
@@ -277,8 +277,8 @@ uint32_t get_effective_difficulty() {
 // Save a valuable hash for later submission if difficulty drops
 void save_pending_share(uint32_t nonce, double difficulty, int zeros, const uint8_t* hash, 
                        const char* job_id, const char* ntime, uint32_t extranonce2) {
-    // Only save shares with 6+ zeros
-    if (zeros < 6) return;
+    // Only save shares with 5+ zeros (for heartbeat)
+    if (zeros < 5) return;
     
     // Remove expired shares (older than 10 minutes = 600 seconds)
     uint32_t now = millis() / 1000;
@@ -876,24 +876,24 @@ void miningTask(void* parameter)
                     // NerdMiner passes hash DIRECTLY - le256todouble handles byte order internally
                     double hash_difficulty = diff_from_target(hash);
                     
+                    // Calculate leading zeros from hash (big-endian, zeros at END)
+                    int zeros = 0;
+                    for(int i = 31; i >= 0; i--) {
+                        if(hash[i] == 0) {
+                            zeros += 2;  // 2 hex digits per byte
+                        } else if((hash[i] & 0xF0) == 0) {
+                            zeros += 1;  // High nibble is zero (e.g., 0x01, 0x0F)
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    
                     // Update best if improved
+                    // NOTE: Filter at 0x32E7 means we only see hashes with diff >= ~1
+                    // So best_difficulty_zeros will only update for high-quality hashes
                     if(hash_difficulty > stats->best_difficulty) {
                         stats->best_difficulty = hash_difficulty;
-                        
-                        // Calculate leading zeros from hash for display
-                        // Hash is in big-endian format, zeros are at the END
-                        // Count from the end (which represents leading zeros in LE interpretation)
-                        int zeros = 0;
-                        for(int i = 31; i >= 0; i--) {
-                            if(hash[i] == 0) {
-                                zeros += 2;  // 2 hex digits per byte
-                            } else if((hash[i] & 0xF0) == 0) {
-                                zeros += 1;  // High nibble is zero (e.g., 0x01, 0x0F)
-                                break;
-                            } else {
-                                break;
-                            }
-                        }
                         stats->best_difficulty_zeros = zeros;
                         
                         char hash_hex[65];
@@ -902,6 +902,10 @@ void miningTask(void* parameter)
                         }
                         hash_hex[64] = '\0';
                         memcpy(stats->best_hash, hash_hex, 65);
+                        
+                        // Debug: log new best
+                        Serial.printf("🏆 Worker %d: New best! %dz (diff %.2f)\n", 
+                                     worker_id, zeros, hash_difficulty);
                     }
                     
                     // Check if valid share
@@ -944,18 +948,16 @@ void miningTask(void* parameter)
                                          should_submit ? "SUBMIT ✓" : "SKIP ✗");
                         }
                         
-                        // Heartbeat: send lower difficulty shares periodically to maintain pool visibility
-                        // Even if rejected, this keeps worker visible and hashrate calculated on pool website
+                        // Heartbeat strategy: Save valuable shares for periodic submission
+                        // The actual heartbeat submission happens outside the mining loop
+                        // to ensure regular submissions even when no new hashes are found
                         uint32_t now = millis() / 1000;
                         bool is_heartbeat = false;
-                        if (!should_submit && share_zeros >= 5 && 
-                            (now - last_heartbeat_share_time) >= 60) {
-                            should_submit = true;
-                            is_heartbeat = true;
-                            last_heartbeat_share_time = now;
-                            Serial.printf("💓 Heartbeat share (%.0f diff, %dz) - keeping worker visible\n", 
-                                         hash_difficulty, share_zeros);
-                        }
+                        
+                        // Calculate minimum zeros for heartbeat
+                        int required_zeros = difficulty_to_zeros(effective_diff);
+                        int heartbeat_threshold = (required_zeros > 2) ? (required_zeros - 2) : 5;
+                        if (heartbeat_threshold < 5) heartbeat_threshold = 5;
                         
                         if(should_submit) {
                             // Format hash in little-endian (zeros at start) - same as "Found xz hash"
@@ -1004,8 +1006,8 @@ void miningTask(void* parameter)
                             }
                         } else {
                             // Valuable hash but doesn't meet current pool requirements
-                            // Save it in case pool lowers difficulty later
-                            if (share_zeros >= 6) {
+                            // Save it for potential heartbeat submission or if pool lowers difficulty
+                            if (share_zeros >= 5) {
                                 save_pending_share(nonce, hash_difficulty, share_zeros, hash,
                                                  current_pool_job.job_id.c_str(),
                                                  current_pool_job.ntime.c_str(), 
@@ -1037,6 +1039,64 @@ void miningTask(void* parameter)
             if((nonce & 0xFF) == 0 && current_pool_job.job_id != current_job_id) {
                 // Job changed, restart with new job
                 continue;
+            }
+            
+            // 💓 HEARTBEAT CHECK: Send pending shares periodically to keep worker visible
+            // Check every batch if we should send a heartbeat from pending shares
+            uint32_t now = millis() / 1000;
+            if ((now - last_heartbeat_share_time) >= 90) {
+                // Try to find a pending share to submit as heartbeat
+                int best_pending_idx = -1;
+                int best_pending_zeros = 0;
+                
+                for(int i = 0; i < MAX_PENDING_SHARES; i++) {
+                    if(pending_shares[i].timestamp > 0 && 
+                       pending_shares[i].job_id == current_pool_job.job_id &&
+                       pending_shares[i].zeros > best_pending_zeros) {
+                        best_pending_idx = i;
+                        best_pending_zeros = pending_shares[i].zeros;
+                    }
+                }
+                
+                // Submit best pending share if found
+                if(best_pending_idx >= 0 && best_pending_zeros >= 5) {
+                    PendingShare* share = &pending_shares[best_pending_idx];
+                    
+                    Serial.printf("💓 Heartbeat: Submitting pending share (%.0f diff, %dz) to keep worker visible\n",
+                                 share->difficulty, share->zeros);
+                    
+                    // Format nonce and extranonce2 for submission
+                    char nonce_hex[9];
+                    snprintf(nonce_hex, sizeof(nonce_hex), "%08x", share->nonce);
+                    
+                    char extranonce2_hex[17];
+                    int hex_len = current_pool_job.extranonce2_size * 2;
+                    for(int i = current_pool_job.extranonce2_size - 1; i >= 0; i--) {
+                        snprintf(extranonce2_hex + ((current_pool_job.extranonce2_size - 1 - i) * 2), 3, 
+                                "%02x", (share->extranonce2 >> (i * 8)) & 0xFF);
+                    }
+                    extranonce2_hex[hex_len] = '\0';
+                    
+                    // Submit heartbeat share
+                    stats->shares_submitted++;
+                    bool sent = stratum_submit_share(share->job_id.c_str(), 
+                                                     extranonce2_hex, 
+                                                     share->ntime.c_str(), 
+                                                     nonce_hex);
+                    
+                    if(sent) {
+                        Serial.println("📤 Heartbeat share sent to pool");
+                    } else {
+                        Serial.println("❌ Heartbeat send failed");
+                        stats->shares_rejected++;
+                    }
+                    
+                    last_heartbeat_share_time = now;
+                } else {
+                    // No pending shares available, reset timer to try again later
+                    Serial.printf("⚠️  No pending shares available for heartbeat (need 5+ zeros)\n");
+                    last_heartbeat_share_time = now;  // Reset to avoid spamming this message
+                }
             }
             
             // Periodic statistics (every 10 batches ~40K nonces = ~1 second at 40 KH/s)

@@ -132,13 +132,13 @@ static void stratum_process_notify(JsonArray params) {
     ESP_LOGI(TAG, "New job: %s", stratum_job_id.c_str());
     
     // 🔥 Se il pool non ha mai inviato mining.set_difficulty, 
-    // assumiamo che stia usando difficulty 1 (minima possibile)
+    // assumiamo difficulty molto bassa (32) adatta per ESP32 a 10 kH/s
     // Questo check avviene su OGNI job per gestire pool che non inviano mai difficulty
     if (stratum_difficulty == 0) {
         extern WifiConfig config;
-        // Se il pool non specifica, proviamo a usare la minDifficulty configurata
-        // oppure 1 come default (Bitcoin difficulty baseline)
-        uint32_t default_diff = (config.minDifficulty > 0) ? config.minDifficulty : 1;
+        // Se il pool non specifica, usa minDifficulty configurata o 32 come default
+        // Difficulty 32 = ~5 zeros, achievable for ESP32 at 10 kH/s (~1 share/30s)
+        uint32_t default_diff = (config.minDifficulty > 0) ? config.minDifficulty : 32;
         stratum_difficulty = default_diff;
         difficulty_was_set = true;
         Serial.printf("⚠️  Pool non ha inviato difficulty - usando default: %u\n", stratum_difficulty);
@@ -339,9 +339,12 @@ void stratum_loop() {
                     Serial.println("[STRATUM] Authorized successfully!");
                     ESP_LOGI(TAG, "Authorized successfully");
                     
-                    // Invia mining.suggest_difficulty per ESP32
+                    // Suggest VERY LOW difficulty for ESP32 hashrate (~10 kH/s)
+                    // At 10 kH/s, we find ~1 share with 5 zeros every 30 seconds
+                    // Difficulty 32 = 5 zeros, Difficulty 64 = ~5.5 zeros
+                    // Use config value if set, otherwise suggest 32 (achievable for ESP32)
                     extern WifiConfig config;
-                    uint32_t suggest_diff = (config.minDifficulty > 0) ? config.minDifficulty : 64;
+                    uint32_t suggest_diff = (config.minDifficulty > 0) ? config.minDifficulty : 32;
                     
                     Serial.printf("[STRATUM] Sending mining.suggest_difficulty: %u\n", suggest_diff);
                     ESP_LOGI(TAG, "Sending mining.suggest_difficulty with value: %u", suggest_diff);
