@@ -1342,6 +1342,10 @@ MiningStats mining_get_stats(void)
     combined.shares_accepted = stats_worker0.shares_accepted + stats_worker1.shares_accepted;
     combined.shares_rejected = stats_worker0.shares_rejected + stats_worker1.shares_rejected;
     
+    // Copy pool connection status and block height from worker 0
+    combined.pool_connected = stats_worker0.pool_connected;
+    combined.block_height = stats_worker0.block_height;
+    
     return combined;
 }
 

@@ -1,0 +1,258 @@
+#include "display_m5paper.h"
+#include "eink_driver.h"
+#include "mining_task.h"
+#include "duino_task.h"
+#include "wifi_config.h"
+#include <Arduino.h>
+#include <WiFi.h>
+
+// M5Paper display dimensions
+#define M5PAPER_WIDTH 960
+#define M5PAPER_HEIGHT 540
+#define STATUS_BAR_HEIGHT 50
+
+// E-ink driver
+static EinkDriver eink;
+
+// Font sizes
+#define FONT_SMALL 1
+#define FONT_MEDIUM 2
+#define FONT_LARGE 3
+#define FONT_XLARGE 4
+
+// Colors (4-bit grayscale)
+#define COLOR_BLACK 0
+#define COLOR_DARK_GRAY 5
+#define COLOR_GRAY 10
+#define COLOR_LIGHT_GRAY 12
+#define COLOR_WHITE 15
+
+// Update tracking
+static unsigned long lastFullRefresh = 0;
+static unsigned long lastPartialRefresh = 0;
+#define FULL_REFRESH_INTERVAL 300000  // 5 minutes
+#define PARTIAL_REFRESH_MIN_INTERVAL 5000  // 5 seconds
+
+// Previous state for change detection
+static char lastTimeStr[32] = "";
+static bool lastWifiConnected = false;
+static bool lastMiningActive = false;
+static uint32_t lastHashRate = 0;
+static uint32_t lastShares = 0;
+static uint32_t lastBestDiff = 0;
+
+void display_m5paper_init(void)
+{
+    Serial.println("[M5PAPER] Initializing E-ink display...");
+    
+    if (!eink.begin()) {
+        Serial.println("[M5PAPER] ERROR: Failed to initialize E-ink driver!");
+        return;
+    }
+    
+    eink.clear(COLOR_WHITE);
+    eink.update();
+    
+    Serial.printf("[M5PAPER] Display initialized: %dx%d\n", M5PAPER_WIDTH, M5PAPER_HEIGHT);
+    
+    lastFullRefresh = millis();
+}
+
+void display_m5paper_clear(void)
+{
+    eink.clear(COLOR_WHITE);
+}
+
+void display_m5paper_refresh(void)
+{
+    unsigned long now = millis();
+    
+    if (now - lastFullRefresh > FULL_REFRESH_INTERVAL) {
+        eink.update();
+        lastFullRefresh = now;
+        lastPartialRefresh = now;
+        Serial.println("[M5Paper] Full refresh");
+    } 
+    else if (now - lastPartialRefresh > PARTIAL_REFRESH_MIN_INTERVAL) {
+        eink.update();
+        lastPartialRefresh = now;
+    }
+}
+
+void display_m5paper_page_logo(bool wifiConnected, const char* timeStr, bool miningActive, bool soloMode, bool isDuinoCoin)
+{
+    eink.clear(COLOR_WHITE);
+    
+    // Title
+    eink.drawString(300, 200, "TzCoinMiner", COLOR_BLACK, FONT_XLARGE);
+    eink.drawString(320, 260, "M5Paper Edition", COLOR_DARK_GRAY, FONT_MEDIUM);
+    
+    // Version info
+    eink.drawString(380, 320, "E-ink Display", COLOR_GRAY, FONT_SMALL);
+    
+    // Status
+    if (wifiConnected) {
+        eink.drawString(360, 400, "WiFi: Connected", COLOR_DARK_GRAY, FONT_SMALL);
+    } else {
+        eink.drawString(360, 400, "WiFi: Disconnected", COLOR_GRAY, FONT_SMALL);
+    }
+    
+    eink.update();
+    lastFullRefresh = millis();
+}
+
+void display_m5paper_page_setup(bool wifiEnabled, bool wifiConnected, const char* timeStr, bool miningActive, bool isSoloMode, bool isDuinoCoin)
+{
+    eink.clear(COLOR_WHITE);
+    
+    // Title
+    eink.drawString(50, 50, "TzCoinMiner Setup", COLOR_BLACK, FONT_LARGE);
+    eink.drawRect(40, 40, M5PAPER_WIDTH - 80, 60, COLOR_DARK_GRAY);
+    
+    // WiFi status
+    if (wifiConnected) {
+        char wifiInfo[100];
+        snprintf(wifiInfo, sizeof(wifiInfo), "WiFi: %s", WiFi.SSID().c_str());
+        eink.drawString(60, 150, wifiInfo, COLOR_BLACK, FONT_MEDIUM);
+        
+        snprintf(wifiInfo, sizeof(wifiInfo), "IP: %s", WiFi.localIP().toString().c_str());
+        eink.drawString(60, 200, wifiInfo, COLOR_DARK_GRAY, FONT_SMALL);
+    } else {
+        eink.drawString(60, 150, "WiFi: Not connected", COLOR_GRAY, FONT_MEDIUM);
+        eink.drawString(60, 200, "Check configuration", COLOR_GRAY, FONT_SMALL);
+    }
+    
+    // Mining status
+    const char* mode = isDuinoCoin ? "Duino-Coin" : (isSoloMode ? "Solo Mining" : "Pool Mining");
+    char buffer[100];
+    snprintf(buffer, sizeof(buffer), "Mode: %s", mode);
+    eink.drawString(60, 280, buffer, COLOR_DARK_GRAY, FONT_SMALL);
+    
+    snprintf(buffer, sizeof(buffer), "Status: %s", miningActive ? "Active" : "Stopped");
+    eink.drawString(60, 320, buffer, COLOR_DARK_GRAY, FONT_SMALL);
+    
+    eink.update();
+    lastFullRefresh = millis();
+}
+
+void display_m5paper_page_mining(bool miningActive, bool wifiConnected, const char* timeStr, bool isSoloMode, bool isDuinoCoin)
+{
+    // Get appropriate stats based on mode
+    MiningStats miningStats;
+    DuinoStats duinoStats;
+    
+    bool hasChanges = false;
+    uint32_t currentHashRate = 0;
+    uint32_t currentShares = 0;
+    uint32_t currentBestDiff = 0;
+    
+    if (isDuinoCoin) {
+        duinoStats = duino_get_stats();
+        currentHashRate = (uint32_t)duinoStats.hashes_per_second;
+        currentShares = duinoStats.shares_accepted;
+        currentBestDiff = (uint32_t)duinoStats.difficulty;
+    } else {
+        miningStats = mining_get_stats();
+        currentHashRate = (uint32_t)miningStats.hashes_per_second;
+        currentShares = miningStats.shares_accepted;
+        currentBestDiff = (uint32_t)miningStats.best_difficulty;
+    }
+    
+    // Check for changes
+    if (currentHashRate != lastHashRate || 
+        currentShares != lastShares || 
+        currentBestDiff != lastBestDiff) {
+        hasChanges = true;
+        lastHashRate = currentHashRate;
+        lastShares = currentShares;
+        lastBestDiff = currentBestDiff;
+    }
+    
+    // Only update if there are changes or it's time for periodic refresh
+    unsigned long now = millis();
+    if (!hasChanges && (now - lastPartialRefresh < PARTIAL_REFRESH_MIN_INTERVAL)) {
+        return;
+    }
+    
+    eink.clear(COLOR_WHITE);
+    
+    // Status bar
+    eink.fillRect(0, 0, M5PAPER_WIDTH, STATUS_BAR_HEIGHT, COLOR_LIGHT_GRAY);
+    
+    if (isDuinoCoin) {
+        eink.drawString(20, 15, "TzCoinMiner - Duino-Coin", COLOR_BLACK, FONT_MEDIUM);
+    } else {
+        const char* modeStr = isSoloMode ? "Solo" : "Pool";
+        char title[50];
+        snprintf(title, sizeof(title), "TzCoinMiner - %s Mining", modeStr);
+        eink.drawString(20, 15, title, COLOR_BLACK, FONT_MEDIUM);
+    }
+    
+    // WiFi status
+    if (wifiConnected) {
+        eink.drawString(M5PAPER_WIDTH - 200, 15, "WiFi: OK", COLOR_BLACK, FONT_MEDIUM);
+    } else {
+        eink.drawString(M5PAPER_WIDTH - 200, 15, "WiFi: --", COLOR_GRAY, FONT_MEDIUM);
+    }
+    
+    // Mining stats area
+    int y = STATUS_BAR_HEIGHT + 40;
+    char buffer[100];
+    
+    // Hashrate
+    if (isDuinoCoin) {
+        snprintf(buffer, sizeof(buffer), "Hashrate: %.2f kH/s", duinoStats.hashes_per_second / 1000.0);
+    } else {
+        snprintf(buffer, sizeof(buffer), "Hashrate: %.2f kH/s", miningStats.hashes_per_second / 1000.0);
+    }
+    eink.drawString(50, y, buffer, COLOR_BLACK, FONT_LARGE);
+    y += 80;
+    
+    // Shares
+    if (isDuinoCoin) {
+        snprintf(buffer, sizeof(buffer), "Shares: %u accepted", duinoStats.shares_accepted);
+    } else {
+        snprintf(buffer, sizeof(buffer), "Shares: %u accepted", miningStats.shares_accepted);
+    }
+    eink.drawString(50, y, buffer, COLOR_BLACK, FONT_LARGE);
+    y += 80;
+    
+    // Difficulty/Rejected
+    if (isDuinoCoin) {
+        snprintf(buffer, sizeof(buffer), "Rejected: %u", duinoStats.shares_rejected);
+        eink.drawString(50, y, buffer, COLOR_BLACK, FONT_LARGE);
+        y += 80;
+        
+        snprintf(buffer, sizeof(buffer), "Difficulty: %.1f", duinoStats.difficulty);
+        eink.drawString(50, y, buffer, COLOR_DARK_GRAY, FONT_SMALL);
+    } else {
+        snprintf(buffer, sizeof(buffer), "Best Diff: %.0f", miningStats.best_difficulty);
+        eink.drawString(50, y, buffer, COLOR_BLACK, FONT_LARGE);
+        y += 80;
+        
+        const char* poolStatus = miningStats.pool_connected ? "Connected" : "Disconnected";
+        snprintf(buffer, sizeof(buffer), "Pool: %s", poolStatus);
+        eink.drawString(50, y, buffer, COLOR_DARK_GRAY, FONT_SMALL);
+    }
+    
+    // Update display
+    display_m5paper_refresh();
+}
+
+void display_m5paper_draw_status_bar(bool wifiConnected, const char* timeStr, bool miningActive, bool isSoloMode, bool isDuinoCoin)
+{
+    // Status bar is integrated in each page function
+    // This is a placeholder to match the header interface
+}
+
+void display_m5paper_sleep(void)
+{
+    Serial.println("[M5PAPER] Entering sleep mode");
+    eink.sleep();
+}
+
+void display_m5paper_wakeup(void)
+{
+    Serial.println("[M5PAPER] Waking up");
+    eink.wakeup();
+}
