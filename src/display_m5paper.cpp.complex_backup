@@ -1,0 +1,251 @@
+#include "display_m5paper.h"
+#include "mining_task.h"
+#include "duino_task.h"
+#include "wifi_config.h"
+#include <M5EPD.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include "esp_task_wdt.h"
+
+// M5Paper display dimensions
+#define M5PAPER_WIDTH 960
+#define M5PAPER_HEIGHT 540
+#define STATUS_BAR_HEIGHT 50
+
+// Canvas for drawing
+M5EPD_Canvas canvas(&M5.EPD);
+
+// Font sizes
+#define FONT_SMALL 2
+#define FONT_MEDIUM 3
+#define FONT_LARGE 4
+
+// Update tracking
+static unsigned long lastFullRefresh = 0;
+#define FULL_REFRESH_INTERVAL 300000  // 5 minutes
+
+// Previous state for change detection
+static uint32_t lastHashRate = 0;
+static uint32_t lastShares = 0;
+static uint32_t lastBestDiff = 0;
+
+void display_m5paper_init(void)
+{
+    Serial.println("[M5PAPER] Initializing M5EPD library...");
+    
+    // Temporarily disable watchdog for this task during long initialization
+    TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+    esp_task_wdt_delete(currentTask);
+    
+    M5.begin();
+    M5.EPD.SetRotation(90);  // Landscape
+    M5.EPD.Clear(true);
+    M5.RTC.begin();
+    
+    canvas.createCanvas(M5PAPER_WIDTH, M5PAPER_HEIGHT);
+    canvas.setTextSize(FONT_MEDIUM);
+    
+    // Re-add watchdog for this task
+    esp_task_wdt_add(currentTask);
+    
+    Serial.printf("[M5PAPER] Display initialized: %dx%d\n", M5PAPER_WIDTH, M5PAPER_HEIGHT);
+    
+    lastFullRefresh = millis();
+}
+
+void display_m5paper_clear(void)
+{
+    // Disable watchdog during E-ink clear (can take several seconds)
+    TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+    esp_task_wdt_delete(currentTask);
+    
+    M5.EPD.Clear(true);
+    canvas.fillCanvas(15);  // White
+    
+    // Re-enable watchdog
+    esp_task_wdt_add(currentTask);
+}
+
+void display_m5paper_refresh(void)
+{
+    unsigned long now = millis();
+    
+    // Disable watchdog during E-ink update (can take several seconds)
+    TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+    esp_task_wdt_delete(currentTask);
+    
+    if (now - lastFullRefresh > FULL_REFRESH_INTERVAL) {
+        canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+        lastFullRefresh = now;
+    } else {
+        canvas.pushCanvas(0, 0, UPDATE_MODE_DU);
+    }
+    
+    // Re-enable watchdog
+    esp_task_wdt_add(currentTask);
+}
+
+void display_m5paper_page_logo(bool wifiConnected, const char* timeStr, bool miningActive, bool soloMode, bool isDuinoCoin)
+{
+    // Disable watchdog during E-ink update
+    TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+    esp_task_wdt_delete(currentTask);
+    
+    canvas.fillCanvas(15);
+    canvas.setTextSize(6);
+    canvas.drawString("TzCoinMiner", 250, 200);
+    
+    canvas.setTextSize(3);
+    canvas.drawString("M5Paper Edition", 300, 280);
+    
+    canvas.setTextSize(2);
+    if (wifiConnected) {
+        canvas.drawString("WiFi: Connected", 350, 380);
+    } else {
+        canvas.drawString("WiFi: Disconnected", 330, 380);
+    }
+    
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    lastFullRefresh = millis();
+    
+    // Re-enable watchdog
+    esp_task_wdt_add(currentTask);
+}
+
+void display_m5paper_page_setup(bool wifiEnabled, bool wifiConnected, const char* timeStr, bool miningActive, bool isSoloMode, bool isDuinoCoin)
+{
+    // Disable watchdog during E-ink update
+    TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+    esp_task_wdt_delete(currentTask);
+    
+    canvas.fillCanvas(15);
+    
+    canvas.setTextSize(4);
+    canvas.drawString("Setup", 50, 50);
+    
+    canvas.setTextSize(3);
+    if (wifiConnected) {
+        String ssid = "WiFi: " + WiFi.SSID();
+        canvas.drawString(ssid.c_str(), 60, 150);
+        
+        String ip = "IP: " + WiFi.localIP().toString();
+        canvas.drawString(ip.c_str(), 60, 200);
+    } else {
+        canvas.drawString("WiFi: Not connected", 60, 150);
+    }
+    
+    canvas.setTextSize(2);
+    const char* mode = isDuinoCoin ? "Duino-Coin" : (isSoloMode ? "Solo Mining" : "Pool Mining");
+    String modeStr = String("Mode: ") + mode;
+    canvas.drawString(modeStr.c_str(), 60, 280);
+    
+    String statusStr = String("Mining: ") + (miningActive ? "Active" : "Stopped");
+    canvas.drawString(statusStr.c_str(), 60, 320);
+    
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    lastFullRefresh = millis();
+    
+    // Re-enable watchdog
+    esp_task_wdt_add(currentTask);
+}
+
+void display_m5paper_page_mining(bool miningActive, bool wifiConnected, const char* timeStr, bool isSoloMode, bool isDuinoCoin)
+{
+    // Get stats
+    MiningStats miningStats;
+    DuinoStats duinoStats;
+    
+    uint32_t currentHashRate = 0;
+    uint32_t currentShares = 0;
+    uint32_t currentBestDiff = 0;
+    
+    if (isDuinoCoin) {
+        duinoStats = duino_get_stats();
+        currentHashRate = (uint32_t)duinoStats.hashes_per_second;
+        currentShares = duinoStats.shares_accepted;
+        currentBestDiff = (uint32_t)duinoStats.difficulty;
+    } else {
+        miningStats = mining_get_stats();
+        currentHashRate = (uint32_t)miningStats.hashes_per_second;
+        currentShares = miningStats.shares_accepted;
+        currentBestDiff = (uint32_t)miningStats.best_difficulty;
+    }
+    
+    // Check for changes
+    if (currentHashRate == lastHashRate && 
+        currentShares == lastShares && 
+        currentBestDiff == lastBestDiff) {
+        return;  // No changes
+    }
+    
+    lastHashRate = currentHashRate;
+    lastShares = currentShares;
+    lastBestDiff = currentBestDiff;
+    
+    canvas.fillCanvas(15);
+    
+    // Title
+    canvas.setTextSize(3);
+    if (isDuinoCoin) {
+        canvas.drawString("Duino-Coin Mining", 50, 30);
+    } else {
+        String title = String(isSoloMode ? "Solo" : "Pool") + " Mining";
+        canvas.drawString(title.c_str(), 50, 30);
+    }
+    
+    // Stats
+    canvas.setTextSize(4);
+    char buffer[100];
+    
+    // Hashrate
+    if (isDuinoCoin) {
+        snprintf(buffer, sizeof(buffer), "%.2f kH/s", duinoStats.hashes_per_second / 1000.0);
+    } else {
+        snprintf(buffer, sizeof(buffer), "%.2f kH/s", miningStats.hashes_per_second / 1000.0);
+    }
+    canvas.drawString("Hashrate:", 50, 120);
+    canvas.drawString(buffer, 50, 170);
+    
+    // Shares
+    if (isDuinoCoin) {
+        snprintf(buffer, sizeof(buffer), "%u", duinoStats.shares_accepted);
+    } else {
+        snprintf(buffer, sizeof(buffer), "%u", miningStats.shares_accepted);
+    }
+    canvas.drawString("Shares:", 50, 260);
+    canvas.drawString(buffer, 50, 310);
+    
+    // Difficulty or status
+    canvas.setTextSize(2);
+    if (isDuinoCoin) {
+        snprintf(buffer, sizeof(buffer), "Diff: %.1f  Rejected: %u", 
+                 duinoStats.difficulty, duinoStats.shares_rejected);
+    } else {
+        snprintf(buffer, sizeof(buffer), "Best Diff: %.0f  Pool: %s", 
+                 miningStats.best_difficulty, 
+                 miningStats.pool_connected ? "Connected" : "Disconnected");
+    }
+    canvas.drawString(buffer, 50, 420);
+    
+    // WiFi status
+    if (wifiConnected) {
+        canvas.drawString("WiFi: OK", M5PAPER_WIDTH - 200, 30);
+    }
+    
+    display_m5paper_refresh();
+}
+
+void display_m5paper_draw_status_bar(bool wifiConnected, const char* timeStr, bool miningActive, bool isSoloMode, bool isDuinoCoin)
+{
+    // Status bar integrated in pages
+}
+
+void display_m5paper_sleep(void)
+{
+    M5.EPD.Sleep();
+}
+
+void display_m5paper_wakeup(void)
+{
+    M5.EPD.SetRotation(90);
+}
